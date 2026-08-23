@@ -584,7 +584,10 @@ if run_pre:
     progress_bar = st.progress(0, text="Starting precompute...")
 
     def progress_callback(i, total, symbol, result):
-        progress_bar.progress(i / total, text=f"[{i}/{total}] {symbol}: {result}")
+        if total > 0:
+            progress_bar.progress(i / total, text=f"[{i}/{total}] {symbol}: {result}")
+        else:
+            progress_bar.progress(0, text=f"{symbol}: {result}")
 
     with st.spinner("Running precompute (this takes a while - one call per symbol)..."):
         cache, state = run_precompute(token, progress_callback)
