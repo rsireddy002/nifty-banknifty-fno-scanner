@@ -1,0 +1,680 @@
+"""
+fno_delta_dashboard.py
+
+Streamlit dashboard for the Delta Support/Resistance + POC + RVOL scanner.
+
+Combines both phases into one app:
+  - "Run Precompute" button: slow, once-per-day step (loops per symbol
+    fetching historical candles) - builds fno_levels_cache.json and seeds
+    accurate crossover times into session state.
+  - "Refresh Live Data" button (+ optional auto-refresh): fast, single batch
+    API call for all symbols' live price/volume.
+
+SETUP:
+    pip install streamlit requests pandas streamlit-autorefresh --break-system-packages
+    $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
+    streamlit run fno_delta_dashboard.py
+
+If UPSTOX_ACCESS_TOKEN isn't set as an env var, the app will ask for it in
+the sidebar (kept in-session only, never written to disk).
+"""
+
+import os
+import json
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+import pandas as pd
+import streamlit as st
+
+# Streamlit Cloud servers run in UTC, not IST - use an explicit fixed IST
+# offset for all "current time" logic so RVOL matching and crossover
+# timestamps are correct regardless of server timezone.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist():
+    return datetime.now(IST)
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
+
+# ---------------- Config ----------------
+UNIT = "minutes"
+INTERVAL_VALUE = "5"
+LOOKBACK_CALENDAR_DAYS = 18
+REQUEST_DELAY_SECONDS = 0.2
+
+PERC = 1.0
+MERGE_THRESHOLD = 0.002
+DELTA_LOOKBACK = 100
+THRESHOLD = 0.7
+SMOOTH_LEN = 5
+
+FO_CSV_LOCAL_PATH = "fo_mktlots.csv"
+CACHE_PATH = "fno_levels_cache.json"
+STATE_PATH = "fno_crossed_state.json"
+INSTRUMENT_SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
+QUOTES_URL = "https://api.upstox.com/v2/market-quote/quotes"
+BATCH_SIZE = 480
+
+DEFAULT_FNO_SYMBOLS = [
+    "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "AXISBANK",
+    "KOTAKBANK", "BAJFINANCE", "BHARTIARTL", "ITC", "LT", "HINDUNILVR",
+    "MARUTI", "TATAMOTORS", "TATASTEEL", "SUNPHARMA", "TITAN", "ULTRACEMCO",
+    "ASIANPAINT", "WIPRO", "NTPC", "POWERGRID", "M&M", "ADANIENT",
+    "ADANIPORTS", "BAJAJFINSV", "HCLTECH", "JSWSTEEL", "ONGC", "COALINDIA",
+    "TECHM", "GRASIM", "DIVISLAB", "DRREDDY", "CIPLA", "EICHERMOT",
+    "HEROMOTOCO", "HINDALCO", "BPCL", "BRITANNIA", "APOLLOHOSP", "SBILIFE",
+    "HDFCLIFE", "INDUSINDBK", "BAJAJ-AUTO", "TATACONSUM", "UPL", "SHREECEM",
+    "NESTLEIND", "VEDANTA", "GAIL", "PIDILITIND", "DLF", "GODREJCP",
+    "SIEMENS", "AMBUJACEM", "BANDHANBNK", "BANKBARODA", "PNB", "CANBK",
+    "IDFCFIRSTB", "FEDERALBNK", "AUROPHARMA", "BEL", "BIOCON", "CHOLAFIN",
+    "COLPAL", "CONCOR", "CUMMINSIND", "DABUR", "DEEPAKNTR", "ESCORTS",
+    "EXIDEIND", "GODREJPROP", "HAVELLS", "HDFCAMC", "ICICIGI", "ICICIPRULI",
+    "IEX", "INDIGO", "INDUSTOWER", "IOC", "IRCTC", "JINDALSTEL", "JUBLFOOD",
+    "LICHSGFIN", "LTIM", "LUPIN", "MANAPPURAM", "MARICO", "MCDOWELL-N",
+    "MFSL", "MOTHERSON", "MPHASIS", "MRF", "MUTHOOTFIN", "NAUKRI",
+    "NMDC", "OBEROIRLTY", "OFSS", "PAGEIND", "PEL", "PERSISTENT",
+    "PETRONET", "PFC", "PIIND", "POLYCAB", "RECLTD", "SAIL", "SBICARD",
+    "SRF", "SYNGENE", "TATACOMM", "TATAPOWER", "TORNTPHARM", "TRENT",
+    "TVSMOTOR", "UBL", "VOLTAS", "ZEEL", "ZYDUSLIFE", "CDSL", "IRFC",
+    "IDEA", "YESBANK", "SUZLON", "ZOMATO", "DMART", "JIOFIN", "PAYTM",
+    "NYKAA", "POLICYBZR", "DELHIVERY", "LODHA", "PATANJALI", "ABCAPITAL",
+    "ALKEM", "APLAPOLLO", "ASHOKLEY", "ASTRAL", "ATUL", "BALKRISNIND",
+    "BATAINDIA", "BHARATFORG", "BHEL", "BSOFT", "CANFINHOME", "CROMPTON",
+    "CUB", "DALBHARAT", "GLENMARK", "GMRINFRA", "GNFC", "GRANULES",
+    "GUJGASLTD", "HAL", "HINDCOPPER", "HINDPETRO", "IBULHSGFIN", "IGL",
+    "INDHOTEL", "INDIAMART", "IPCALAB", "JKCEMENT", "L&TFH", "LALPATHLAB",
+    "LAURUSLABS", "M&MFIN", "METROPOLIS", "NATIONALUM", "NAVINFLUOR",
+    "OIL", "PVRINOX", "RAIN", "RBLBANK", "SUNTV", "TATACHEM",
+    "TATAELXSI", "TORNTPOWER", "UNIONBANK", "VBL", "WHIRLPOOL",
+    "AARTIIND", "ABFRL", "ANGELONE", "APOLLOTYRE", "AUBANK", "BANKINDIA",
+    "BSE", "CGPOWER", "CHAMBLFERT", "COFORGE", "COROMANDEL", "DIXON",
+    "FORTIS", "GICRE", "GODFRYPHLP", "GRAPHITE", "GSPL", "HFCL",
+    "HUDCO", "IIFL", "INDIACEM", "IRB", "ITI", "KALYANKJIL",
+    "KEI", "LTF", "MANKIND", "MAXHEALTH", "MGL", "MOTILALOFS",
+    "NBCC", "NCC", "NHPC", "PFIZER", "PGEL", "POWERINDIA",
+    "PRESTIGE", "RVNL", "SJVN", "SOLARINDS", "SONACOMS", "STARHEALTH",
+    "SUPREMEIND", "TIINDIA", "TITAGARH", "VEDL", "ZFCVINDIA",
+]
+
+
+# ---------------- Shared logic (same as the two standalone scripts) ----------------
+
+def load_symbol_universe():
+    if os.path.exists(FO_CSV_LOCAL_PATH):
+        try:
+            df = pd.read_csv(FO_CSV_LOCAL_PATH, skiprows=4, header=None)
+            symbols = df[1].astype(str).str.strip().unique().tolist()
+            symbols = [s for s in symbols if s and s.upper() not in ("NIFTY", "BANKNIFTY", "FINNIFTY")]
+            return symbols
+        except Exception:
+            pass
+    return DEFAULT_FNO_SYMBOLS
+
+
+INDEX_FUTURES = ["NIFTY", "BANKNIFTY"]
+
+
+def resolve_futures_instrument_key(name, token):
+    """Resolve the nearest-expiry futures contract for an index (NIFTY,
+    BANKNIFTY) via the Instrument Search API - same approach used for the
+    standalone nifty_fut_lipi_extract.py verification script."""
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": f"Bearer {token}"}
+    params = {
+        "query": name, "exchanges": "NSE", "segments": "FO",
+        "instrument_types": "FUT", "expiry": "current_month",
+        "page_number": 1, "records": 30,
+    }
+    resp = requests.get(INSTRUMENT_SEARCH_URL, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    candidates = [
+        inst for inst in payload.get("data", [])
+        if inst.get("instrument_type") == "FUT" and inst.get("underlying_symbol", "").upper() == name.upper()
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x["expiry"])
+    return candidates[0]["instrument_key"]
+
+
+def resolve_equity_instrument_key(symbol, token):
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": f"Bearer {token}"}
+    params = {"query": symbol, "exchanges": "NSE", "segments": "EQ", "page_number": 1, "records": 10}
+    resp = requests.get(INSTRUMENT_SEARCH_URL, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    for inst in payload.get("data", []):
+        if inst.get("trading_symbol", "").upper() == symbol.upper() and inst.get("instrument_type") == "EQ":
+            return inst["instrument_key"]
+    return None
+
+
+def fetch_candles(instrument_key, token):
+    to_date = now_ist().strftime("%Y-%m-%d")
+    from_date = (now_ist() - timedelta(days=LOOKBACK_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+    url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/{UNIT}/{INTERVAL_VALUE}/{to_date}/{from_date}"
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    candles = payload.get("data", {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["date"] = df["timestamp"].dt.date
+    return df
+
+
+def find_swing_points(df, pivot_window=12):
+    """Detect swing highs/lows across the FULL lookback period (not just
+    today) using a fractal pivot method: a bar's low/high is a swing point
+    if it's the lowest/highest within pivot_window bars on both sides.
+    pivot_window=12 at 5-min bars = ~1 hour of context each side, filtering
+    out minor noise in favor of more meaningful swing levels."""
+    df = df.reset_index(drop=True)
+    n = len(df)
+    swing_lows = []
+    swing_highs = []
+    for i in range(pivot_window, n - pivot_window):
+        window_low = df["low"].iloc[i - pivot_window:i + pivot_window + 1]
+        window_high = df["high"].iloc[i - pivot_window:i + pivot_window + 1]
+        if df["low"].iloc[i] == window_low.min():
+            swing_lows.append(round(df["low"].iloc[i], 2))
+        if df["high"].iloc[i] == window_high.max():
+            swing_highs.append(round(df["high"].iloc[i], 2))
+    return sorted(set(swing_lows)), sorted(set(swing_highs))
+
+
+def compute_levels_and_baseline(df):
+    df = df.copy()
+    df["volumeDelta"] = (df["close"] - df["open"]) * df["volume"]
+    df["cumDelta"] = df["volumeDelta"].rolling(SMOOTH_LEN, min_periods=1).sum()
+    df["maxDelta"] = df["cumDelta"].rolling(DELTA_LOOKBACK, min_periods=1).max()
+    df["minDelta"] = df["cumDelta"].rolling(DELTA_LOOKBACK, min_periods=1).min()
+    df["rangeDelta"] = df["maxDelta"] - df["minDelta"]
+    df["isStrongBuy"] = df["cumDelta"] > (df["minDelta"] + df["rangeDelta"] * THRESHOLD)
+    df["isStrongSell"] = df["cumDelta"] < (df["maxDelta"] - df["rangeDelta"] * THRESHOLD)
+
+    todayVAH = todayVAL = todayPOC = float("nan")
+    prevVAH = prevVAL = prevPOC = float("nan")
+    prevSupport = prevResistance = float("nan")
+    support_before_today = resistance_before_today = float("nan")
+    last_date = None
+
+    for _, row in df.iterrows():
+        d = row["date"]
+        if d != last_date:
+            support_before_today = prevSupport
+            resistance_before_today = prevResistance
+            last_date = d
+            prevVAH, prevVAL, prevPOC = todayVAH, todayVAL, todayPOC
+
+            sumPV = row["close"] * row["volume"]
+            sumVol = row["volume"]
+            dayHigh = row["high"]
+            dayLow = row["low"]
+            dVWAP = sumPV / sumVol if sumVol else float("nan")
+            dRange = dayHigh - dayLow
+            halfRange = dRange * (PERC * 0.5)
+
+            todayPOC = dVWAP
+            todayVAH = dVWAP + halfRange
+            todayVAL = dVWAP - halfRange
+
+            if not pd.isna(prevVAH) and prevVAH != 0 and abs(todayVAH - prevVAH) / prevVAH < MERGE_THRESHOLD:
+                todayVAH = (todayVAH + prevVAH) / 2
+            if not pd.isna(prevVAL) and prevVAL != 0 and abs(todayVAL - prevVAL) / prevVAL < MERGE_THRESHOLD:
+                todayVAL = (todayVAL + prevVAL) / 2
+            if not pd.isna(prevPOC) and prevPOC != 0 and abs(todayPOC - prevPOC) / prevPOC < MERGE_THRESHOLD:
+                todayPOC = (todayPOC + prevPOC) / 2
+
+            if row["isStrongBuy"]:
+                prevSupport = row["low"]
+            if row["isStrongSell"]:
+                prevResistance = row["high"]
+
+    if df.empty:
+        return None
+
+    today = df["date"].max()
+    today_df = df[df["date"] == today].sort_values("timestamp")
+    prior_days_df = df[df["date"] < today]
+    prior_days = sorted(prior_days_df["date"].unique())
+
+    yesterday_close = prior_days_df["close"].iloc[-1] if not prior_days_df.empty else float("nan")
+    already_above_yesterday = (
+        not pd.isna(support_before_today) and not pd.isna(resistance_before_today) and
+        not pd.isna(yesterday_close) and
+        yesterday_close > support_before_today and yesterday_close > resistance_before_today
+    )
+    already_below_yesterday = (
+        not pd.isna(support_before_today) and not pd.isna(resistance_before_today) and
+        not pd.isna(yesterday_close) and
+        yesterday_close < support_before_today and yesterday_close < resistance_before_today
+    )
+
+    crossover_time_str = None  # bullish: first candle closing above BOTH levels
+    crossunder_time_str = None  # bearish: first candle closing below BOTH levels
+    has_prior_levels = not pd.isna(support_before_today) and not pd.isna(resistance_before_today)
+
+    if has_prior_levels and not already_above_yesterday:
+        prev_above = False
+        for _, row in today_df.iterrows():
+            above_now = row["close"] > support_before_today and row["close"] > resistance_before_today
+            if above_now and not prev_above:
+                crossover_time_str = row["timestamp"].strftime("%H:%M")
+                break
+            prev_above = above_now
+
+    if has_prior_levels and not already_below_yesterday:
+        prev_below = False
+        for _, row in today_df.iterrows():
+            below_now = row["close"] < support_before_today and row["close"] < resistance_before_today
+            if below_now and not prev_below:
+                crossunder_time_str = row["timestamp"].strftime("%H:%M")
+                break
+            prev_below = below_now
+
+    baseline_days = prior_days[-10:]
+    rvol_baseline = {}
+    if baseline_days:
+        for d in baseline_days:
+            day_df = df[df["date"] == d].sort_values("timestamp")
+            cum_vol = 0
+            for _, row in day_df.iterrows():
+                cum_vol += row["volume"]
+                t_str = row["timestamp"].strftime("%H:%M")
+                rvol_baseline.setdefault(t_str, []).append(cum_vol)
+        rvol_baseline = {t: sum(v) / len(v) for t, v in rvol_baseline.items()}
+
+    swing_lows, swing_highs = find_swing_points(df)
+
+    return {
+        "poc": None if pd.isna(todayPOC) else round(todayPOC, 2),
+        "delta_support": None if pd.isna(support_before_today) else round(support_before_today, 2),
+        "delta_resistance": None if pd.isna(resistance_before_today) else round(resistance_before_today, 2),
+        "yesterday_close": None if pd.isna(yesterday_close) else round(yesterday_close, 2),
+        "already_above_yesterday": bool(already_above_yesterday),
+        "already_below_yesterday": bool(already_below_yesterday),
+        "crossover_time": crossover_time_str,
+        "crossunder_time": crossunder_time_str,
+        "rvol_baseline": rvol_baseline,
+        "swing_lows": swing_lows,
+        "swing_highs": swing_highs,
+        "computed_date": str(today),
+    }
+
+
+def run_precompute(token, progress_callback=None):
+    cache = {}
+
+    # Index futures first - always included regardless of the equity universe
+    for name in INDEX_FUTURES:
+        try:
+            instrument_key = resolve_futures_instrument_key(name, token)
+            if not instrument_key:
+                if progress_callback:
+                    progress_callback(0, 0, name, "no futures contract found")
+                continue
+            time.sleep(REQUEST_DELAY_SECONDS)
+            df = fetch_candles(instrument_key, token)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            if df.empty:
+                continue
+            levels = compute_levels_and_baseline(df)
+            if levels is None:
+                continue
+            levels["instrument_key"] = instrument_key
+            levels["is_index"] = True
+            cache[name] = levels
+            if progress_callback:
+                progress_callback(0, 0, name, "ok (index future)")
+        except Exception as e:
+            if progress_callback:
+                progress_callback(0, 0, name, f"error: {e}")
+            continue
+
+    symbols = load_symbol_universe()
+    for i, symbol in enumerate(symbols, start=1):
+        try:
+            instrument_key = resolve_equity_instrument_key(symbol, token)
+            if not instrument_key:
+                if progress_callback:
+                    progress_callback(i, len(symbols), symbol, "no instrument key")
+                continue
+            time.sleep(REQUEST_DELAY_SECONDS)
+            df = fetch_candles(instrument_key, token)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            if df.empty:
+                if progress_callback:
+                    progress_callback(i, len(symbols), symbol, "no data")
+                continue
+            levels = compute_levels_and_baseline(df)
+            if levels is None:
+                continue
+            levels["instrument_key"] = instrument_key
+            levels["is_index"] = False
+            cache[symbol] = levels
+            if progress_callback:
+                progress_callback(i, len(symbols), symbol, "ok")
+        except Exception as e:
+            if progress_callback:
+                progress_callback(i, len(symbols), symbol, f"error: {e}")
+            continue
+
+    with open(CACHE_PATH, "w") as f:
+        json.dump(cache, f, indent=2)
+
+    today_str = now_ist().strftime("%Y-%m-%d")
+    state = {"_date": today_str}
+    for symbol, levels in cache.items():
+        if levels.get("already_above_yesterday"):
+            state[symbol] = {"status": "continuing_up"}
+        elif levels.get("already_below_yesterday"):
+            state[symbol] = {"status": "continuing_down"}
+        elif levels.get("crossover_time"):
+            state[symbol] = {"status": "crossed_up", "time": levels["crossover_time"]}
+        elif levels.get("crossunder_time"):
+            state[symbol] = {"status": "crossed_down", "time": levels["crossunder_time"]}
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+    return cache, state
+
+
+def fetch_batch_quotes(instrument_keys, token):
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": f"Bearer {token}"}
+    all_data = {}
+    for i in range(0, len(instrument_keys), BATCH_SIZE):
+        chunk = instrument_keys[i:i + BATCH_SIZE]
+        params = {"instrument_key": ",".join(chunk)}
+        max_retries = 4
+        for attempt in range(max_retries):
+            resp = requests.get(QUOTES_URL, headers=headers, params=params, timeout=20)
+            if resp.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            all_data.update(payload.get("data", {}))
+            break
+    return all_data
+
+
+def nearest_rvol_baseline(rvol_baseline, current_time_str):
+    if not rvol_baseline:
+        return None
+    candidates = [t for t in rvol_baseline.keys() if t <= current_time_str]
+    if not candidates:
+        return None
+    return rvol_baseline[max(candidates)]
+
+
+def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
+    today_str = now_ist().strftime("%Y-%m-%d")
+    now_time_str = now_ist().strftime("%H:%M")
+    if state.get("_date") != today_str:
+        state = {"_date": today_str}
+
+    symbols = list(cache.keys())
+    instrument_keys = [cache[s]["instrument_key"] for s in symbols]
+    key_to_symbol = {cache[s]["instrument_key"]: s for s in symbols}
+
+    quotes = fetch_batch_quotes(instrument_keys, token)
+
+    results = []
+    for quote_key, q in quotes.items():
+        instrument_key = q.get("instrument_token")
+        symbol = key_to_symbol.get(instrument_key)
+        if not symbol:
+            continue
+
+        levels = cache[symbol]
+        support = levels["delta_support"]
+        resistance = levels["delta_resistance"]
+        poc = levels["poc"]
+        already_above_yesterday = levels["already_above_yesterday"]
+        already_below_yesterday = levels.get("already_below_yesterday", False)
+
+        current_price = q.get("last_price")
+        today_volume = q.get("volume")
+
+        rvol_pct = None
+        baseline_vol = nearest_rvol_baseline(levels.get("rvol_baseline", {}), now_time_str)
+        if baseline_vol and today_volume is not None and baseline_vol > 0:
+            rvol_pct = round((today_volume / baseline_vol) * 100, 1)
+
+        if support is None or resistance is None or current_price is None:
+            status = "no prior delta zone yet"
+            zone_width_pct = None
+            next_support = next_resistance = None
+        else:
+            zone_width_pct = round(((resistance - support) / current_price) * 100, 2)
+            is_wide_zone = zone_width_pct > max_zone_width_pct
+
+            swing_lows = levels.get("swing_lows", [])
+            swing_highs = levels.get("swing_highs", [])
+            lows_below = [s for s in swing_lows if s < current_price]
+            highs_above = [r for r in swing_highs if r > current_price]
+            next_support = max(lows_below) if lows_below else None
+            next_resistance = min(highs_above) if highs_above else None
+
+            is_above_both = current_price > support and current_price > resistance
+            is_below_both = current_price < support and current_price < resistance
+            prior_state = state.get(symbol)
+            prior_status = prior_state.get("status") if prior_state else None
+
+            if is_above_both:
+                if already_above_yesterday and prior_status is None:
+                    status = "ABOVE BOTH (continuing)"
+                    state[symbol] = {"status": "continuing_up"}
+                elif prior_status in ("crossed_up", "continuing_up"):
+                    if prior_status == "crossed_up":
+                        status = f"JUST CROSSED UP @ {prior_state['time']}"
+                    else:
+                        status = "ABOVE BOTH (continuing)"
+                else:
+                    status = f"JUST CROSSED UP @ {now_time_str}"
+                    state[symbol] = {"status": "crossed_up", "time": now_time_str}
+                if status.startswith("JUST CROSSED") and is_wide_zone:
+                    status += " (wide zone - caution)"
+            elif is_below_both:
+                if already_below_yesterday and prior_status is None:
+                    status = "BELOW BOTH (continuing)"
+                    state[symbol] = {"status": "continuing_down"}
+                elif prior_status in ("crossed_down", "continuing_down"):
+                    if prior_status == "crossed_down":
+                        status = f"JUST CROSSED DOWN @ {prior_state['time']}"
+                    else:
+                        status = "BELOW BOTH (continuing)"
+                else:
+                    status = f"JUST CROSSED DOWN @ {now_time_str}"
+                    state[symbol] = {"status": "crossed_down", "time": now_time_str}
+                if status.startswith("JUST CROSSED") and is_wide_zone:
+                    status += " (wide zone - caution)"
+            else:
+                status = "-"
+                if symbol in state:
+                    del state[symbol]
+
+        results.append({
+            "Symbol": symbol, "CurrentPrice": current_price, "POC": poc,
+            "DeltaSupport": support, "DeltaResistance": resistance,
+            "NextSupport": next_support, "NextResistance": next_resistance,
+            "ZoneWidth%": zone_width_pct,
+            "RVOL%": rvol_pct, "Status": status,
+            "IsIndex": levels.get("is_index", False),
+        })
+
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df, state, now_time_str
+
+    def sort_key(row):
+        if row.get("IsIndex"):
+            return (-1, row["Symbol"])  # NIFTY/BANKNIFTY always first
+        status = row["Status"]
+        if status.startswith("JUST CROSSED"):
+            time_part = status.split("@ ")[-1]
+            return (0, time_part)
+        elif status in ("ABOVE BOTH (continuing)", "BELOW BOTH (continuing)"):
+            return (1, "")
+        else:
+            return (2, "")
+
+    result_df["_sort"] = result_df.apply(sort_key, axis=1)
+    result_df = result_df.sort_values("_sort").drop(columns=["_sort", "IsIndex"]).reset_index(drop=True)
+    result_df.insert(0, "S.No", range(1, len(result_df) + 1))
+    return result_df, state, now_time_str
+
+
+# ---------------- Streamlit UI ----------------
+
+st.set_page_config(page_title="F&O Delta Scanner", layout="wide")
+st.title("F&O Delta Support/Resistance + POC + RVOL Scanner")
+
+with st.sidebar:
+    st.header("Setup")
+    env_token = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
+    token = st.text_input("Upstox Access Token", value=env_token, type="password",
+                           help="Set UPSTOX_ACCESS_TOKEN env var to skip this, or paste it here (session only).")
+
+    st.divider()
+    st.header("Step 1: Precompute (once per day)")
+    st.caption("Run any time after ~9:20 AM. Slow (~1-2 min for full universe).")
+    run_pre = st.button("Run Precompute", type="primary", use_container_width=True)
+
+    st.divider()
+    st.header("Step 2: Live Refresh")
+    max_zone_width_pct = st.slider(
+        "Max Zone Width % (flag entries wider than this)", 0.5, 5.0, 1.5, 0.1,
+        help="If the gap between Delta Support and Delta Resistance exceeds this % of price, "
+             "fresh crossover signals get flagged '(wide zone - caution)' instead of treated as clean entries."
+    )
+    refresh_now = st.button("Refresh Live Data Now", use_container_width=True)
+
+    auto_refresh = st.checkbox("Auto-refresh", value=False)
+    refresh_interval = st.slider("Refresh every (seconds)", 30, 300, 60, disabled=not auto_refresh)
+    if auto_refresh and not HAS_AUTOREFRESH:
+        st.warning("Install streamlit-autorefresh for auto-refresh: "
+                   "pip install streamlit-autorefresh --break-system-packages")
+    if auto_refresh and HAS_AUTOREFRESH:
+        st_autorefresh(interval=refresh_interval * 1000, key="auto_refresh_timer")
+
+if not token:
+    st.warning("Enter your Upstox access token in the sidebar to begin.")
+    st.stop()
+
+# Run precompute
+if run_pre:
+    progress_bar = st.progress(0, text="Starting precompute...")
+
+    def progress_callback(i, total, symbol, result):
+        progress_bar.progress(i / total, text=f"[{i}/{total}] {symbol}: {result}")
+
+    with st.spinner("Running precompute (this takes a while - one call per symbol)..."):
+        cache, state = run_precompute(token, progress_callback)
+    progress_bar.empty()
+    st.success(f"Precompute complete: {len(cache)} symbols cached, "
+               f"{sum(1 for k in state if k != '_date')} known crossover states seeded.")
+    st.session_state["cache"] = cache
+    st.session_state["state"] = state
+
+# Load cache/state from disk if not in session
+if "cache" not in st.session_state:
+    if os.path.exists(CACHE_PATH):
+        with open(CACHE_PATH) as f:
+            st.session_state["cache"] = json.load(f)
+    else:
+        st.session_state["cache"] = {}
+
+if "state" not in st.session_state:
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH) as f:
+            st.session_state["state"] = json.load(f)
+    else:
+        st.session_state["state"] = {}
+
+cache = st.session_state["cache"]
+
+if not cache:
+    st.info("No cached levels yet. Click 'Run Precompute' in the sidebar to get started.")
+    st.stop()
+
+st.caption(f"Cache has {len(cache)} symbols. Last precomputed: "
+           f"{next(iter(cache.values())).get('computed_date', 'unknown')}")
+
+# Run live scan (on button, or auto-refresh trigger)
+should_refresh = refresh_now or auto_refresh
+
+if should_refresh:
+    with st.spinner("Fetching live quotes..."):
+        result_df, state, now_time_str = run_live_scan(cache, st.session_state["state"], token, max_zone_width_pct)
+    st.session_state["state"] = state
+    st.session_state["result_df"] = result_df
+    st.session_state["last_update"] = now_time_str
+
+if "result_df" not in st.session_state:
+    st.info("Click 'Refresh Live Data Now' in the sidebar to fetch the latest scan.")
+    st.stop()
+
+result_df = st.session_state["result_df"]
+last_update = st.session_state.get("last_update", "-")
+
+st.subheader(f"Live Watchlist - last updated {last_update}")
+
+intraday_df = result_df[
+    result_df["Status"].str.startswith("JUST CROSSED") |
+    result_df["Status"].isin(["ABOVE BOTH (continuing)", "BELOW BOTH (continuing)"]) |
+    result_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+].copy()
+intraday_df["S.No"] = range(1, len(intraday_df) + 1)
+
+
+def highlight_status(row):
+    status = row["Status"]
+    if "(wide zone" in status:
+        return ["background-color: #4a4a2a"] * len(row)  # dim yellow-gray - caution, don't enter
+    elif status.startswith("JUST CROSSED UP"):
+        return ["background-color: #d4f7d4"] * len(row)  # green - fresh bullish
+    elif status.startswith("JUST CROSSED DOWN"):
+        return ["background-color: #f7d4d4"] * len(row)  # red - fresh bearish
+    elif status == "ABOVE BOTH (continuing)":
+        return ["background-color: #eaf5ff"] * len(row)  # light blue - continuing bullish
+    elif status == "BELOW BOTH (continuing)":
+        return ["background-color: #fff0e0"] * len(row)  # light orange - continuing bearish
+    return [""] * len(row)
+
+
+tab1, tab2 = st.tabs(["Intraday Watchlist", "Full Scan"])
+
+with tab1:
+    if intraday_df.empty:
+        st.write("No stocks currently above both delta levels.")
+    else:
+        st.dataframe(
+            intraday_df.style.apply(highlight_status, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv = intraday_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download watchlist CSV", csv, "fno_intraday_watchlist.csv", "text/csv")
+
+with tab2:
+    st.dataframe(result_df, use_container_width=True, hide_index=True)
+    csv_full = result_df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download full scan CSV", csv_full, "fno_live_full.csv", "text/csv")
