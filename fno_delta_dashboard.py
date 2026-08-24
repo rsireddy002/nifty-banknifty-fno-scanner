@@ -57,6 +57,7 @@ SMOOTH_LEN = 5
 FO_CSV_LOCAL_PATH = "fo_mktlots.csv"
 CACHE_PATH = "fno_levels_cache.json"
 STATE_PATH = "fno_crossed_state.json"
+SIGNAL_LOG_PATH = "fno_signal_log.json"
 INSTRUMENT_SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
 QUOTES_URL = "https://api.upstox.com/v2/market-quote/quotes"
 BATCH_SIZE = 480
@@ -505,6 +506,45 @@ def nearest_rvol_baseline(rvol_baseline, current_time_str):
     return rvol_baseline[max(candidates)]
 
 
+def load_signal_log():
+    today_str = now_ist().strftime("%Y-%m-%d")
+    if os.path.exists(SIGNAL_LOG_PATH):
+        with open(SIGNAL_LOG_PATH) as f:
+            log = json.load(f)
+        if log.get("_date") == today_str:
+            return log
+    return {"_date": today_str, "entries": []}
+
+
+def save_signal_log(log):
+    with open(SIGNAL_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+
+
+def append_to_signal_log(log, category, df, detail_col):
+    """Append any NEW (not-already-logged-today) entries from df to the log,
+    deduped by (symbol, category, detail) so a stock that keeps showing the
+    same status across multiple refreshes doesn't get logged repeatedly -
+    but a genuinely new event (different time/detail) does."""
+    existing_keys = {(e["symbol"], e["category"], e["detail"]) for e in log["entries"]}
+    for _, row in df.iterrows():
+        detail = str(row[detail_col])
+        key = (row["Symbol"], category, detail)
+        if key in existing_keys:
+            continue
+        log["entries"].append({
+            "logged_at": now_ist().strftime("%H:%M"),
+            "symbol": row["Symbol"],
+            "category": category,
+            "current_price": row.get("CurrentPrice"),
+            "vwap": row.get("VWAP"),
+            "zone_width_pct": row.get("ZoneWidth%"),
+            "detail": detail,
+        })
+        existing_keys.add(key)
+    return log
+
+
 def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
                    vwap_above_support_max_pct=0.5, vwap_resistance_room_min_pct=1.0,
                    vwap_resistance_room_max_pct=2.0):
@@ -645,6 +685,19 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
             if was_above_resistance is True and not now_above_resistance and simple_status == "-":
                 simple_status = "CROSSING RESISTANCE FROM ABOVE"
             state[resistance_key] = {"above": now_above_resistance}
+
+        # Plain VWAP crossings - independent of the zone-conditioned VWAP
+        # Reclaim setup above. Just: did price cross above/below VWAP itself.
+        if vwap is not None and current_price is not None:
+            vwap_side_key = f"{symbol}_vwap_side"
+            was_above_vwap_side = state.get(vwap_side_key, {}).get("above")
+            now_above_vwap_side = current_price > vwap
+            if simple_status == "-":
+                if was_above_vwap_side is False and now_above_vwap_side:
+                    simple_status = "CROSSED ABOVE VWAP FROM BELOW"
+                elif was_above_vwap_side is True and not now_above_vwap_side:
+                    simple_status = "CROSSED BELOW VWAP FROM ABOVE"
+            state[vwap_side_key] = {"above": now_above_vwap_side}
 
         # Both-level events take priority over single-level ones when both apply
         if status.startswith("JUST CROSSED UP"):
@@ -905,6 +958,7 @@ heatmap_df["BoxSize"] = heatmap_df["SignedMove"].abs().clip(lower=0.1)
 simple_status_order = {
     "CROSSED UP": 0, "CROSSED BELOW": 1, "ABOVE BOTH": 2, "BELOW BOTH": 3,
     "CROSSING SUPPORT FROM BELOW": 4, "CROSSING RESISTANCE FROM ABOVE": 5,
+    "CROSSED ABOVE VWAP FROM BELOW": 6, "CROSSED BELOW VWAP FROM ABOVE": 7,
 }
 simple_df = result_df[result_df["SimpleStatus"] != "-"].copy()
 simple_df["_sort"] = simple_df["SimpleStatus"].map(simple_status_order).fillna(9)
@@ -928,6 +982,10 @@ def highlight_simple_status(row):
         return ["background-color: #c8f0d8"] * len(row)
     elif s == "CROSSING RESISTANCE FROM ABOVE":
         return ["background-color: #f0d8c8"] * len(row)
+    elif s == "CROSSED ABOVE VWAP FROM BELOW":
+        return ["background-color: #d8f0e8"] * len(row)
+    elif s == "CROSSED BELOW VWAP FROM ABOVE":
+        return ["background-color: #f0e0d8"] * len(row)
     return [""] * len(row)
 
 
@@ -951,12 +1009,17 @@ tight_breakout_room_df = tight_breakout_room_df.sort_values(
 ).drop(columns="_pin").reset_index(drop=True)
 tight_breakout_room_df.insert(0, "S.No", range(1, len(tight_breakout_room_df) + 1))
 
-# Wide-zone single-level crossings: price just reclaimed support or just
-# lost resistance, but the zone itself is wide (>=1%) - a looser, earlier
-# setup, opposite in character to the tight-zone table above
+# Wide-zone single-level crossings: price just reclaimed support (from
+# below, confirmed by also being above VWAP) or just lost resistance (from
+# above, confirmed by also being below VWAP), with a wide zone (>=1%) -
+# looser, earlier setups than the tight-zone table above, with VWAP as a
+# directional confirmation on top of the level crossing itself.
 wide_single_cols = ["Symbol", "CurrentPrice", "VWAP", "ZoneWidth%", "RVOL%", "SimpleStatus"]
 wide_single_level_df = result_df[
-    result_df["SimpleStatus"].isin(["CROSSING SUPPORT FROM BELOW", "CROSSING RESISTANCE FROM ABOVE"]) &
+    (
+        ((result_df["SimpleStatus"] == "CROSSING SUPPORT FROM BELOW") & (result_df["CurrentPrice"] > result_df["VWAP"])) |
+        ((result_df["SimpleStatus"] == "CROSSING RESISTANCE FROM ABOVE") & (result_df["CurrentPrice"] < result_df["VWAP"]))
+    ) &
     (result_df["ZoneWidth%"].abs() >= 1.0)
 ][wide_single_cols].copy()
 wide_single_level_df["_pin"] = wide_single_level_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
@@ -965,11 +1028,36 @@ wide_single_level_df = wide_single_level_df.sort_values(
 ).drop(columns="_pin").reset_index(drop=True)
 wide_single_level_df.insert(0, "S.No", range(1, len(wide_single_level_df) + 1))
 
-tabI, tabT, tabW, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level",
+# Persistent daily log: since both tables above only show CURRENT state,
+# anything that triggers and later reverts (or was only ever a single-scan
+# event, as with Wide Zone Single-Level) would otherwise vanish without a
+# trace. This accumulates every distinct trigger seen today for verification.
+signal_log = load_signal_log()
+signal_log = append_to_signal_log(signal_log, "Tight Zone + Room", tight_breakout_room_df, "Status")
+signal_log = append_to_signal_log(signal_log, "Wide Zone Single-Level", wide_single_level_df, "SimpleStatus")
+save_signal_log(signal_log)
+
+log_df = pd.DataFrame(signal_log["entries"])
+if not log_df.empty:
+    log_df = log_df.sort_values("logged_at").reset_index(drop=True)
+    log_df.insert(0, "S.No", range(1, len(log_df) + 1))
+    log_df.columns = ["S.No", "Time", "Symbol", "Category", "CurrentPrice", "VWAP", "ZoneWidth%", "Detail"]
+
+tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level", "Signal Log (Today)",
      "Simple View", "Sector Movers", "Bullish (Up)", "Bearish (Down)",
      "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
 )
+
+with tabL:
+    st.caption("Every distinct Tight Zone+Room and Wide Zone Single-Level trigger seen today, for verification - "
+               "including ones that later reverted or only appeared for a single scan. Resets at the start of each new day.")
+    if log_df.empty:
+        st.write("No signals logged yet today.")
+    else:
+        st.dataframe(log_df, use_container_width=True, hide_index=True)
+        csv_log = log_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download signal log CSV", csv_log, "fno_signal_log.csv", "text/csv")
 
 with tabT:
     st.caption("Fresh full breakouts (both levels) where the zone is tight (<0.5%) AND there's at least 1% of clear "
@@ -982,8 +1070,9 @@ with tabT:
         st.download_button("Download tight-zone+room CSV", csv_tr, "fno_tight_zone_room.csv", "text/csv")
 
 with tabW:
-    st.caption("Price just reclaimed support (from below) or just lost resistance (from above), but the zone itself "
-               "is wide (>=1%) - a looser, single-level setup, the opposite character to the tight-zone table.")
+    st.caption("Price just reclaimed support (from below, confirmed above VWAP) or just lost resistance "
+               "(from above, confirmed below VWAP), with a wide zone (>=1%) - a looser, single-level setup "
+               "with VWAP as directional confirmation.")
     if wide_single_level_df.empty:
         st.write("No matching signals currently.")
     else:
