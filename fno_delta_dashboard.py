@@ -469,14 +469,17 @@ def run_precompute(token, progress_callback=None):
     today_str = now_ist().strftime("%Y-%m-%d")
     state = {"_date": today_str}
     for symbol, levels in cache.items():
+        # Only seed the STABLE "already above/below" continuation state here.
+        # Do NOT seed "crossed_up"/"crossed_down" from historical crossover_time -
+        # Upstox's historical candle API lags a full day behind, so that data
+        # actually reflects the LAST COMPLETE session, not today. Stamping it
+        # with today's date would disguise an old crossing as a fresh one.
+        # Genuine fresh crossings TODAY get detected properly by the live scan
+        # itself, comparing real-time price against these same levels.
         if levels.get("already_above_yesterday"):
             state[symbol] = {"status": "continuing_up"}
         elif levels.get("already_below_yesterday"):
             state[symbol] = {"status": "continuing_down"}
-        elif levels.get("crossover_time"):
-            state[symbol] = {"status": "crossed_up", "time": levels["crossover_time"], "price": levels.get("crossover_price")}
-        elif levels.get("crossunder_time"):
-            state[symbol] = {"status": "crossed_down", "time": levels["crossunder_time"], "price": levels.get("crossunder_price")}
     with open(STATE_PATH, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -847,7 +850,8 @@ if run_pre:
         cache, state = run_precompute(token, progress_callback)
     progress_bar.empty()
     st.success(f"Precompute complete: {len(cache)} symbols cached, "
-               f"{sum(1 for k in state if k != '_date')} known crossover states seeded.")
+               f"{sum(1 for k in state if k != '_date')} already-above/below continuation states seeded. "
+               f"Fresh crossings will be detected live as they happen today.")
     st.session_state["cache"] = cache
     st.session_state["state"] = state
 
@@ -872,8 +876,10 @@ if not cache:
     st.info("No cached levels yet. Click 'Run Precompute' in the sidebar to get started.")
     st.stop()
 
-st.caption(f"Cache has {len(cache)} symbols. Last precomputed: "
-           f"{next(iter(cache.values())).get('computed_date', 'unknown')}")
+st.caption(f"Cache has {len(cache)} symbols. Delta Support/Resistance levels computed through: "
+           f"{next(iter(cache.values())).get('computed_date', 'unknown')} "
+           f"(Upstox's historical data lags one full session behind - this is expected, not stale. "
+           f"Live prices and fresh crossings below are real-time.)")
 
 # Run live scan (on button, or auto-refresh trigger)
 should_refresh = refresh_now or auto_refresh
