@@ -119,6 +119,90 @@ def load_symbol_universe():
 
 INDEX_FUTURES = ["NIFTY", "BANKNIFTY"]
 
+SECTOR_MAP = {
+    "NIFTY": "Index", "BANKNIFTY": "Index",
+    "HDFCBANK": "Banking", "ICICIBANK": "Banking", "SBIN": "Banking", "AXISBANK": "Banking",
+    "KOTAKBANK": "Banking", "INDUSINDBK": "Banking", "BANKBARODA": "Banking", "PNB": "Banking",
+    "CANBK": "Banking", "IDFCFIRSTB": "Banking", "FEDERALBNK": "Banking", "BANDHANBNK": "Banking",
+    "RBLBANK": "Banking", "AUBANK": "Banking", "UNIONBANK": "Banking", "YESBANK": "Banking",
+    "BAJFINANCE": "NBFC/Financial Services", "BAJAJFINSV": "NBFC/Financial Services",
+    "HDFCAMC": "NBFC/Financial Services", "SBICARD": "NBFC/Financial Services",
+    "CHOLAFIN": "NBFC/Financial Services", "MUTHOOTFIN": "NBFC/Financial Services",
+    "MANAPPURAM": "NBFC/Financial Services", "LICHSGFIN": "NBFC/Financial Services",
+    "M&MFIN": "NBFC/Financial Services", "L&TFH": "NBFC/Financial Services",
+    "PFC": "NBFC/Financial Services", "RECLTD": "NBFC/Financial Services",
+    "IIFL": "NBFC/Financial Services", "ABCAPITAL": "NBFC/Financial Services",
+    "MFSL": "NBFC/Financial Services", "ANGELONE": "NBFC/Financial Services",
+    "MOTILALOFS": "NBFC/Financial Services", "CANFINHOME": "NBFC/Financial Services",
+    "IEX": "NBFC/Financial Services", "BSE": "NBFC/Financial Services",
+    "IRFC": "NBFC/Financial Services",
+    "ICICIGI": "Insurance", "ICICIPRULI": "Insurance", "SBILIFE": "Insurance",
+    "HDFCLIFE": "Insurance", "GICRE": "Insurance", "STARHEALTH": "Insurance",
+    "TCS": "IT", "INFY": "IT", "HCLTECH": "IT", "WIPRO": "IT", "TECHM": "IT",
+    "LTIM": "IT", "MPHASIS": "IT", "PERSISTENT": "IT", "COFORGE": "IT",
+    "OFSS": "IT", "BSOFT": "IT", "TATAELXSI": "IT", "LTF": "IT",
+    "MARUTI": "Auto", "TATAMOTORS": "Auto", "M&M": "Auto", "BAJAJ-AUTO": "Auto",
+    "EICHERMOT": "Auto", "HEROMOTOCO": "Auto", "TVSMOTOR": "Auto", "ASHOKLEY": "Auto",
+    "APOLLOTYRE": "Auto", "MOTHERSON": "Auto", "BHARATFORG": "Auto", "SONACOMS": "Auto",
+    "ESCORTS": "Auto",
+    "SUNPHARMA": "Pharma", "DIVISLAB": "Pharma", "DRREDDY": "Pharma", "CIPLA": "Pharma",
+    "AUROPHARMA": "Pharma", "LUPIN": "Pharma", "BIOCON": "Pharma", "ALKEM": "Pharma",
+    "TORNTPHARM": "Pharma", "GLENMARK": "Pharma", "LAURUSLABS": "Pharma", "IPCALAB": "Pharma",
+    "ZYDUSLIFE": "Pharma", "MANKIND": "Pharma", "PFIZER": "Pharma", "GRANULES": "Pharma",
+    "APOLLOHOSP": "Healthcare", "FORTIS": "Healthcare", "MAXHEALTH": "Healthcare",
+    "LALPATHLAB": "Healthcare", "METROPOLIS": "Healthcare", "SYNGENE": "Healthcare",
+    "HINDUNILVR": "FMCG", "ITC": "FMCG", "NESTLEIND": "FMCG", "BRITANNIA": "FMCG",
+    "DABUR": "FMCG", "MARICO": "FMCG", "COLPAL": "FMCG", "GODREJCP": "FMCG",
+    "TATACONSUM": "FMCG", "UBL": "FMCG", "VBL": "FMCG", "PATANJALI": "FMCG",
+    "MCDOWELL-N": "FMCG", "JUBLFOOD": "FMCG",
+    "TATASTEEL": "Metals & Mining", "JSWSTEEL": "Metals & Mining", "HINDALCO": "Metals & Mining",
+    "VEDANTA": "Metals & Mining", "VEDL": "Metals & Mining", "SAIL": "Metals & Mining",
+    "NMDC": "Metals & Mining", "NATIONALUM": "Metals & Mining", "HINDCOPPER": "Metals & Mining",
+    "JINDALSTEL": "Metals & Mining", "COALINDIA": "Metals & Mining",
+    "RELIANCE": "Oil & Gas", "ONGC": "Oil & Gas", "BPCL": "Oil & Gas", "IOC": "Oil & Gas",
+    "GAIL": "Oil & Gas", "PETRONET": "Oil & Gas", "OIL": "Oil & Gas", "HINDPETRO": "Oil & Gas",
+    "IGL": "Oil & Gas", "MGL": "Oil & Gas", "GUJGASLTD": "Oil & Gas", "GSPL": "Oil & Gas",
+    "NTPC": "Power", "POWERGRID": "Power", "TATAPOWER": "Power", "ADANIENT": "Power",
+    "NHPC": "Power", "SJVN": "Power", "TORNTPOWER": "Power", "CGPOWER": "Power",
+    "POWERINDIA": "Power", "SUZLON": "Power", "SOLARINDS": "Power",
+    "ULTRACEMCO": "Cement & Construction", "SHREECEM": "Cement & Construction",
+    "AMBUJACEM": "Cement & Construction", "DALBHARAT": "Cement & Construction",
+    "JKCEMENT": "Cement & Construction", "GRASIM": "Cement & Construction",
+    "LT": "Infra & Capital Goods", "SIEMENS": "Infra & Capital Goods", "BEL": "Infra & Capital Goods",
+    "HAL": "Infra & Capital Goods", "BHEL": "Infra & Capital Goods", "CUMMINSIND": "Infra & Capital Goods",
+    "POLYCAB": "Infra & Capital Goods", "HAVELLS": "Infra & Capital Goods", "VOLTAS": "Infra & Capital Goods",
+    "CROMPTON": "Infra & Capital Goods", "NCC": "Infra & Capital Goods", "IRB": "Infra & Capital Goods",
+    "RVNL": "Infra & Capital Goods", "TITAGARH": "Infra & Capital Goods", "GMRINFRA": "Infra & Capital Goods",
+    "APLAPOLLO": "Infra & Capital Goods", "KEI": "Infra & Capital Goods", "ZFCVINDIA": "Infra & Capital Goods",
+    "NBCC": "Infra & Capital Goods", "ITI": "Infra & Capital Goods",
+    "BHARTIARTL": "Telecom", "IDEA": "Telecom", "INDUSTOWER": "Telecom", "TATACOMM": "Telecom",
+    "HFCL": "Telecom",
+    "ASIANPAINT": "Consumer Durables", "TITAN": "Consumer Durables", "PIDILITIND": "Consumer Durables",
+    "WHIRLPOOL": "Consumer Durables", "DIXON": "Consumer Durables", "BATAINDIA": "Consumer Durables",
+    "PAGEIND": "Consumer Durables", "EXIDEIND": "Consumer Durables",
+    "UPL": "Chemicals & Fertilizers", "PIIND": "Chemicals & Fertilizers", "SRF": "Chemicals & Fertilizers",
+    "DEEPAKNTR": "Chemicals & Fertilizers", "AARTIIND": "Chemicals & Fertilizers",
+    "NAVINFLUOR": "Chemicals & Fertilizers", "ATUL": "Chemicals & Fertilizers",
+    "GNFC": "Chemicals & Fertilizers", "CHAMBLFERT": "Chemicals & Fertilizers",
+    "TATACHEM": "Chemicals & Fertilizers", "COROMANDEL": "Chemicals & Fertilizers",
+    "GRAPHITE": "Chemicals & Fertilizers", "SUPREMEIND": "Chemicals & Fertilizers",
+    "DLF": "Realty", "GODREJPROP": "Realty", "OBEROIRLTY": "Realty", "LODHA": "Realty",
+    "PRESTIGE": "Realty", "IBULHSGFIN": "Realty", "HUDCO": "Realty",
+    "ZEEL": "Media & Entertainment", "SUNTV": "Media & Entertainment", "PVRINOX": "Media & Entertainment",
+    "TRENT": "Retail", "DMART": "Retail", "JIOFIN": "Retail", "NAUKRI": "Retail",
+    "INDIAMART": "Retail", "NYKAA": "Retail", "POLICYBZR": "Retail", "ZOMATO": "Retail",
+    "PAYTM": "Retail",
+    "INDIGO": "Aviation & Logistics", "IRCTC": "Aviation & Logistics", "CONCOR": "Aviation & Logistics",
+    "DELHIVERY": "Aviation & Logistics",
+    "ADANIPORTS": "Diversified/Conglomerate",
+}
+
+
+def get_sector(symbol):
+    return SECTOR_MAP.get(symbol, "Other")
+
+
+
 
 def resolve_futures_instrument_key(name, token):
     """Resolve the nearest-expiry futures contract for an index (NIFTY,
@@ -421,7 +505,9 @@ def nearest_rvol_baseline(rvol_baseline, current_time_str):
     return rvol_baseline[max(candidates)]
 
 
-def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
+def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
+                   vwap_above_support_max_pct=0.5, vwap_resistance_room_min_pct=1.0,
+                   vwap_resistance_room_max_pct=2.0):
     today_str = now_ist().strftime("%Y-%m-%d")
     now_time_str = now_ist().strftime("%H:%M")
     if state.get("_date") != today_str:
@@ -449,6 +535,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
 
         current_price = q.get("last_price")
         today_volume = q.get("volume")
+        vwap = q.get("average_price")  # Upstox's day-average price, used as VWAP proxy
 
         rvol_pct = None
         baseline_vol = nearest_rvol_baseline(levels.get("rvol_baseline", {}), now_time_str)
@@ -516,8 +603,31 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
                 if symbol in state:
                     del state[symbol]
 
+        # VWAP-reclaim setup: VWAP sitting just above Delta Support (tight,
+        # well-positioned base), Delta Resistance 1-2% above VWAP (room to
+        # run), and price currently above VWAP - a distinct setup from the
+        # support/resistance zone crossovers above.
+        vwap_setup_detail = None
+        if vwap and support and resistance and current_price:
+            vwap_above_support_pct = ((vwap - support) / support) * 100
+            resistance_room_pct = ((resistance - vwap) / vwap) * 100
+            zone_positioned_well = (
+                0 <= vwap_above_support_pct <= vwap_above_support_max_pct and
+                vwap_resistance_room_min_pct <= resistance_room_pct <= vwap_resistance_room_max_pct
+            )
+            price_above_vwap = current_price > vwap
+            vwap_key = f"{symbol}_vwap"
+            was_above_vwap = state.get(vwap_key, {}).get("above", False)
+
+            if zone_positioned_well and price_above_vwap:
+                vwap_setup_detail = f"VWAP RECLAIM @ {now_time_str}" if not was_above_vwap else "VWAP RECLAIM (holding)"
+                state[vwap_key] = {"above": True}
+            else:
+                state[vwap_key] = {"above": price_above_vwap}
+
         results.append({
-            "Symbol": symbol, "CurrentPrice": current_price, "POC": poc,
+            "Symbol": symbol, "Sector": get_sector(symbol), "CurrentPrice": current_price,
+            "POC": poc, "VWAP": vwap,
             "DeltaSupport": support, "DeltaResistance": resistance,
             "NextSupport": next_support, "NextResistance": next_resistance,
             "ZoneWidth%": zone_width_pct,
@@ -526,7 +636,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
                 else round(((support - current_price) / support) * 100, 2) if is_below_both
                 else None
             ),
-            "RVOL%": rvol_pct, "Status": status,
+            "RVOL%": rvol_pct, "Status": status, "VWAPSetup": vwap_setup_detail,
             "IsIndex": levels.get("is_index", False),
         })
 
@@ -578,6 +688,15 @@ with st.sidebar:
         help="If the gap between Delta Support and Delta Resistance exceeds this % of price, "
              "fresh crossover signals get flagged '(wide zone - caution)' instead of treated as clean entries."
     )
+    with st.expander("VWAP Reclaim Setup thresholds"):
+        vwap_above_support_max_pct = st.slider(
+            "Max VWAP above Support (%)", 0.1, 2.0, 0.5, 0.1,
+            help="VWAP must sit no more than this % above Delta Support to count as 'just above'."
+        )
+        vwap_room_range = st.slider(
+            "Resistance room above VWAP (%)", 0.5, 5.0, (1.0, 2.0), 0.1,
+            help="Delta Resistance must be this far above VWAP - enough room to run, not already at the ceiling."
+        )
     refresh_now = st.button("Refresh Live Data Now", use_container_width=True)
 
     auto_refresh = st.checkbox("Auto-refresh", value=False)
@@ -639,7 +758,10 @@ should_refresh = refresh_now or auto_refresh
 
 if should_refresh:
     with st.spinner("Fetching live quotes..."):
-        result_df, state, now_time_str = run_live_scan(cache, st.session_state["state"], token, max_zone_width_pct)
+        result_df, state, now_time_str = run_live_scan(
+            cache, st.session_state["state"], token, max_zone_width_pct,
+            vwap_above_support_max_pct, vwap_room_range[0], vwap_room_range[1]
+        )
     st.session_state["state"] = state
     st.session_state["result_df"] = result_df
     st.session_state["last_update"] = now_time_str
@@ -692,7 +814,31 @@ bearish_df["_index_pin"] = bearish_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
 bearish_df = bearish_df.sort_values(["_index_pin", "%Move"], ascending=[False, False], na_position="last").drop(columns="_index_pin").reset_index(drop=True)
 bearish_df["S.No"] = range(1, len(bearish_df) + 1)
 
-tab1, tab2, tab3, tab4 = st.tabs(["Bullish (Up)", "Bearish (Down)", "All Intraday", "Full Scan"])
+# Sector Overview: breadth of stocks above VWAP per sector, plus counts of
+# tight-zone fresh breakouts and VWAP-reclaim setups per sector
+sector_rows = []
+for sector, grp in result_df[result_df["Sector"] != "Index"].groupby("Sector"):
+    total = len(grp)
+    valid_vwap = grp["VWAP"].notna() & grp["CurrentPrice"].notna()
+    above_vwap = ((grp["CurrentPrice"] > grp["VWAP"]) & valid_vwap).sum()
+    pct_above_vwap = round((above_vwap / total) * 100, 1) if total > 0 else None
+    tight_breakouts = grp["Status"].str.startswith("JUST CROSSED", na=False) & ~grp["Status"].str.contains("wide zone|INVERTED", na=False)
+    vwap_setups = grp["VWAPSetup"].notna().sum()
+    sector_rows.append({
+        "Sector": sector, "TotalStocks": total, "AboveVWAP": above_vwap,
+        "PctAboveVWAP": pct_above_vwap, "CleanBreakouts": int(tight_breakouts.sum()),
+        "VWAPSetups": int(vwap_setups),
+    })
+sector_df = pd.DataFrame(sector_rows).sort_values("PctAboveVWAP", ascending=False).reset_index(drop=True)
+
+vwap_setup_df = result_df[result_df["VWAPSetup"].notna()].copy()
+vwap_setup_df = vwap_setup_df.sort_values("VWAPSetup").reset_index(drop=True)
+if not vwap_setup_df.empty:
+    vwap_setup_df.insert(0, "S.No", range(1, len(vwap_setup_df) + 1))
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Bullish (Up)", "Bearish (Down)", "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
+)
 
 with tab1:
     if bullish_df.empty:
@@ -721,6 +867,26 @@ with tab2:
         st.download_button("Download bearish CSV", csv_bear, "fno_bearish_watchlist.csv", "text/csv")
 
 with tab3:
+    st.caption("Breadth per sector: what % of stocks are trading above VWAP right now, plus clean breakout and VWAP-reclaim setup counts. "
+               "A sector near 100% above VWAP with several breakouts suggests a genuine sector-wide move, not an isolated stock.")
+    if sector_df.empty:
+        st.write("No sector data available.")
+    else:
+        st.dataframe(sector_df, use_container_width=True, hide_index=True)
+        csv_sector = sector_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download sector overview CSV", csv_sector, "fno_sector_overview.csv", "text/csv")
+
+with tab4:
+    st.caption("VWAP sitting just above Delta Support with 1-2% room to Delta Resistance, and price currently above VWAP - "
+               "a distinct setup from the support/resistance zone breakouts.")
+    if vwap_setup_df.empty:
+        st.write("No VWAP reclaim setups currently.")
+    else:
+        st.dataframe(vwap_setup_df, use_container_width=True, hide_index=True)
+        csv_vwap = vwap_setup_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download VWAP setups CSV", csv_vwap, "fno_vwap_setups.csv", "text/csv")
+
+with tab5:
     if intraday_df.empty:
         st.write("No stocks currently above both delta levels.")
     else:
@@ -732,7 +898,7 @@ with tab3:
         csv = intraday_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download watchlist CSV", csv, "fno_intraday_watchlist.csv", "text/csv")
 
-with tab4:
+with tab6:
     st.dataframe(result_df, use_container_width=True, hide_index=True)
     csv_full = result_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download full scan CSV", csv_full, "fno_live_full.csv", "text/csv")
