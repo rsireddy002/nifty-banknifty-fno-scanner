@@ -349,7 +349,9 @@ def compute_levels_and_baseline(df):
     )
 
     crossover_time_str = None  # bullish: first candle closing above BOTH levels
+    crossover_price_val = None
     crossunder_time_str = None  # bearish: first candle closing below BOTH levels
+    crossunder_price_val = None
     has_prior_levels = not pd.isna(support_before_today) and not pd.isna(resistance_before_today)
 
     if has_prior_levels and not already_above_yesterday:
@@ -358,6 +360,7 @@ def compute_levels_and_baseline(df):
             above_now = row["close"] > support_before_today and row["close"] > resistance_before_today
             if above_now and not prev_above:
                 crossover_time_str = row["timestamp"].strftime("%H:%M")
+                crossover_price_val = round(row["close"], 2)
                 break
             prev_above = above_now
 
@@ -367,6 +370,7 @@ def compute_levels_and_baseline(df):
             below_now = row["close"] < support_before_today and row["close"] < resistance_before_today
             if below_now and not prev_below:
                 crossunder_time_str = row["timestamp"].strftime("%H:%M")
+                crossunder_price_val = round(row["close"], 2)
                 break
             prev_below = below_now
 
@@ -392,7 +396,9 @@ def compute_levels_and_baseline(df):
         "already_above_yesterday": bool(already_above_yesterday),
         "already_below_yesterday": bool(already_below_yesterday),
         "crossover_time": crossover_time_str,
+        "crossover_price": crossover_price_val,
         "crossunder_time": crossunder_time_str,
+        "crossunder_price": crossunder_price_val,
         "rvol_baseline": rvol_baseline,
         "swing_lows": swing_lows,
         "swing_highs": swing_highs,
@@ -468,9 +474,9 @@ def run_precompute(token, progress_callback=None):
         elif levels.get("already_below_yesterday"):
             state[symbol] = {"status": "continuing_down"}
         elif levels.get("crossover_time"):
-            state[symbol] = {"status": "crossed_up", "time": levels["crossover_time"]}
+            state[symbol] = {"status": "crossed_up", "time": levels["crossover_time"], "price": levels.get("crossover_price")}
         elif levels.get("crossunder_time"):
-            state[symbol] = {"status": "crossed_down", "time": levels["crossunder_time"]}
+            state[symbol] = {"status": "crossed_down", "time": levels["crossunder_time"], "price": levels.get("crossunder_price")}
     with open(STATE_PATH, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -587,6 +593,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
             zone_width_pct = None
             next_support = next_resistance = None
             is_above_both = is_below_both = False
+            entry_price = None
         else:
             zone_width_pct = round(((resistance - support) / current_price) * 100, 2)
             is_inverted_zone = zone_width_pct < 0
@@ -603,6 +610,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
             is_below_both = current_price < support and current_price < resistance
             prior_state = state.get(symbol)
             prior_status = prior_state.get("status") if prior_state else None
+            entry_price = None
 
             if is_above_both:
                 if already_above_yesterday and prior_status is None:
@@ -611,11 +619,13 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
                 elif prior_status in ("crossed_up", "continuing_up"):
                     if prior_status == "crossed_up":
                         status = f"JUST CROSSED UP @ {prior_state['time']}"
+                        entry_price = prior_state.get("price")
                     else:
                         status = "ABOVE BOTH (continuing)"
                 else:
                     status = f"JUST CROSSED UP @ {now_time_str}"
-                    state[symbol] = {"status": "crossed_up", "time": now_time_str}
+                    entry_price = current_price
+                    state[symbol] = {"status": "crossed_up", "time": now_time_str, "price": current_price}
                 if status.startswith("JUST CROSSED"):
                     if is_inverted_zone:
                         status += " (INVERTED ZONE - unreliable)"
@@ -628,11 +638,13 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
                 elif prior_status in ("crossed_down", "continuing_down"):
                     if prior_status == "crossed_down":
                         status = f"JUST CROSSED DOWN @ {prior_state['time']}"
+                        entry_price = prior_state.get("price")
                     else:
                         status = "BELOW BOTH (continuing)"
                 else:
                     status = f"JUST CROSSED DOWN @ {now_time_str}"
-                    state[symbol] = {"status": "crossed_down", "time": now_time_str}
+                    entry_price = current_price
+                    state[symbol] = {"status": "crossed_down", "time": now_time_str, "price": current_price}
                 if status.startswith("JUST CROSSED"):
                     if is_inverted_zone:
                         status += " (INVERTED ZONE - unreliable)"
@@ -733,6 +745,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
 
         results.append({
             "Symbol": symbol, "Sector": get_sector(symbol), "CurrentPrice": current_price,
+            "EntryPrice": entry_price if entry_price is not None else current_price,
             "POC": poc, "VWAP": vwap,
             "DeltaSupport": support, "DeltaResistance": resistance,
             "NextSupport": next_support, "NextResistance": next_resistance,
@@ -1076,7 +1089,7 @@ MIN_STOPLOSS_DISTANCE_PCT = 0.1
 trade_rows = []
 for _, row in result_df.iterrows():
     s = row["SimpleStatus"]
-    price = row["CurrentPrice"]
+    price = row["EntryPrice"]
     if pd.isna(price):
         continue
 
@@ -1093,6 +1106,7 @@ for _, row in result_df.iterrows():
             continue
         trade_rows.append({
             "Symbol": row["Symbol"], "Action": "BUY", "Price": price,
+            "LTP": row["CurrentPrice"],
             "StopLoss": stop_loss, "Target": target, "RVOL%": row["RVOL%"],
             "Time": row["SignalTime"],
         })
@@ -1109,6 +1123,7 @@ for _, row in result_df.iterrows():
             continue
         trade_rows.append({
             "Symbol": row["Symbol"], "Action": "SELL", "Price": price,
+            "LTP": row["CurrentPrice"],
             "StopLoss": stop_loss, "Target": target, "RVOL%": row["RVOL%"],
             "Time": row["SignalTime"],
         })
@@ -1136,9 +1151,10 @@ tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = s
 
 with tabX:
     st.caption("BUY = fresh bullish event (crossed up, support reclaim, or VWAP reclaim). SELL = fresh bearish event. "
-               "StopLoss/Target are validated for directional sanity - Target must be genuinely favorable and StopLoss "
-               "genuinely unfavorable, each by at least 0.1%, or the row is excluded rather than shown with a broken number. "
-               "Time = when the underlying signal actually fired.")
+               "Price = entry price AT THE MOMENT the signal fired. LTP = current live price, for tracking how far "
+               "it's moved since entry. StopLoss/Target are validated against the entry price for directional sanity - "
+               "Target must be genuinely favorable and StopLoss genuinely unfavorable, each by at least 0.1%, or the "
+               "row is excluded. Time = when the underlying signal actually fired.")
     if trade_df.empty:
         st.write("No fresh trade ideas right now.")
     else:
