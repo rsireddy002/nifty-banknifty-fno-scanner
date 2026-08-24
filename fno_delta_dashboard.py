@@ -717,6 +717,20 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
         elif is_below_both and next_support is not None and current_price:
             next_level_distance_pct = round(((current_price - next_support) / current_price) * 100, 2)
 
+        # Time the underlying signal actually fired - parsed from the
+        # "@ HH:MM" in Status for full both-level crossings, or the current
+        # scan time for single-level/VWAP crossings (which are one-scan
+        # events by design, so "now" IS when they fired).
+        signal_time = None
+        if status.startswith("JUST CROSSED"):
+            try:
+                signal_time = status.split("@ ")[1].split(" ")[0]
+            except IndexError:
+                signal_time = now_time_str
+        elif simple_status in ("CROSSING SUPPORT FROM BELOW", "CROSSING RESISTANCE FROM ABOVE",
+                                "CROSSED ABOVE VWAP FROM BELOW", "CROSSED BELOW VWAP FROM ABOVE"):
+            signal_time = now_time_str
+
         results.append({
             "Symbol": symbol, "Sector": get_sector(symbol), "CurrentPrice": current_price,
             "POC": poc, "VWAP": vwap,
@@ -730,6 +744,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
                 else None
             ),
             "RVOL%": rvol_pct, "Status": status, "SimpleStatus": simple_status,
+            "SignalTime": signal_time,
             "VWAPSetup": vwap_setup_detail,
             "IsIndex": levels.get("is_index", False),
         })
@@ -1044,27 +1059,58 @@ if not log_df.empty:
     log_df.columns = ["S.No", "Time", "Symbol", "Category", "CurrentPrice", "VWAP", "ZoneWidth%", "Detail"]
 
 # ONE simple decision sheet: Symbol, Action (BUY/SELL), entry price,
-# stop-loss, target. Only fresh events (not "continuing"), so the list
-# stays short and each row is an actual actionable idea, not a status log.
+# stop-loss, target, time signal fired. Only fresh events (not "continuing"),
+# so the list stays short and each row is an actual actionable idea.
+# Every row is validated for directional sanity before being included:
+# for a BUY, Target must be genuinely above Price and StopLoss genuinely
+# below (and vice versa for SELL) - a broken fallback level (e.g. from an
+# inverted zone) that would put Target on the wrong side gets excluded
+# rather than shown with a nonsensical number. A minimum distance also
+# filters out setups with negligible reward or a stop so tight it offers
+# no real room.
 BUY_STATUSES = ["CROSSED UP", "CROSSING SUPPORT FROM BELOW", "CROSSED ABOVE VWAP FROM BELOW"]
 SELL_STATUSES = ["CROSSED BELOW", "CROSSING RESISTANCE FROM ABOVE", "CROSSED BELOW VWAP FROM ABOVE"]
+MIN_TARGET_DISTANCE_PCT = 0.1
+MIN_STOPLOSS_DISTANCE_PCT = 0.1
 
 trade_rows = []
 for _, row in result_df.iterrows():
     s = row["SimpleStatus"]
+    price = row["CurrentPrice"]
+    if pd.isna(price):
+        continue
+
     if s in BUY_STATUSES:
         stop_loss = row["DeltaSupport"]
         target = row["NextResistance"] if pd.notna(row["NextResistance"]) else row["DeltaResistance"]
+        if pd.isna(stop_loss) or pd.isna(target):
+            continue
+        if not (stop_loss < price < target):
+            continue
+        if (target - price) / price * 100 < MIN_TARGET_DISTANCE_PCT:
+            continue
+        if (price - stop_loss) / price * 100 < MIN_STOPLOSS_DISTANCE_PCT:
+            continue
         trade_rows.append({
-            "Symbol": row["Symbol"], "Action": "BUY", "Price": row["CurrentPrice"],
+            "Symbol": row["Symbol"], "Action": "BUY", "Price": price,
             "StopLoss": stop_loss, "Target": target, "RVOL%": row["RVOL%"],
+            "Time": row["SignalTime"],
         })
     elif s in SELL_STATUSES:
         stop_loss = row["DeltaResistance"]
         target = row["NextSupport"] if pd.notna(row["NextSupport"]) else row["DeltaSupport"]
+        if pd.isna(stop_loss) or pd.isna(target):
+            continue
+        if not (target < price < stop_loss):
+            continue
+        if (price - target) / price * 100 < MIN_TARGET_DISTANCE_PCT:
+            continue
+        if (stop_loss - price) / price * 100 < MIN_STOPLOSS_DISTANCE_PCT:
+            continue
         trade_rows.append({
-            "Symbol": row["Symbol"], "Action": "SELL", "Price": row["CurrentPrice"],
+            "Symbol": row["Symbol"], "Action": "SELL", "Price": price,
             "StopLoss": stop_loss, "Target": target, "RVOL%": row["RVOL%"],
+            "Time": row["SignalTime"],
         })
 
 trade_df = pd.DataFrame(trade_rows)
@@ -1090,8 +1136,9 @@ tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = s
 
 with tabX:
     st.caption("BUY = fresh bullish event (crossed up, support reclaim, or VWAP reclaim). SELL = fresh bearish event. "
-               "StopLoss = the level that would invalidate the idea if price falls back through it. "
-               "Target = the next level in that direction.")
+               "StopLoss/Target are validated for directional sanity - Target must be genuinely favorable and StopLoss "
+               "genuinely unfavorable, each by at least 0.1%, or the row is excluded rather than shown with a broken number. "
+               "Time = when the underlying signal actually fired.")
     if trade_df.empty:
         st.write("No fresh trade ideas right now.")
     else:
