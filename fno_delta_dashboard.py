@@ -880,17 +880,17 @@ intraday_df["S.No"] = range(1, len(intraday_df) + 1)
 def highlight_status(row):
     status = row["Status"]
     if "INVERTED ZONE" in status:
-        return ["background-color: #5a2a4a"] * len(row)  # dark magenta - structurally unreliable
+        return ["background-color: #5a2a4a; color: white"] * len(row)  # dark magenta - structurally unreliable
     elif "(wide zone" in status:
-        return ["background-color: #4a4a2a"] * len(row)  # dim yellow-gray - caution, don't enter
+        return ["background-color: #4a4a2a; color: white"] * len(row)  # dim yellow-gray - caution, don't enter
     elif status.startswith("JUST CROSSED UP"):
-        return ["background-color: #d4f7d4"] * len(row)  # green - fresh bullish
+        return ["background-color: #d4f7d4; color: black"] * len(row)  # green - fresh bullish
     elif status.startswith("JUST CROSSED DOWN"):
-        return ["background-color: #f7d4d4"] * len(row)  # red - fresh bearish
+        return ["background-color: #f7d4d4; color: black"] * len(row)  # red - fresh bearish
     elif status == "ABOVE BOTH (continuing)":
-        return ["background-color: #eaf5ff"] * len(row)  # light blue - continuing bullish
+        return ["background-color: #eaf5ff; color: black"] * len(row)  # light blue - continuing bullish
     elif status == "BELOW BOTH (continuing)":
-        return ["background-color: #fff0e0"] * len(row)  # light orange - continuing bearish
+        return ["background-color: #fff0e0; color: black"] * len(row)  # light orange - continuing bearish
     return [""] * len(row)
 
 
@@ -971,21 +971,21 @@ simple_df.insert(0, "S.No", range(1, len(simple_df) + 1))
 def highlight_simple_status(row):
     s = row["SimpleStatus"]
     if s == "CROSSED UP":
-        return ["background-color: #d4f7d4"] * len(row)
+        return ["background-color: #d4f7d4; color: black"] * len(row)
     elif s == "CROSSED BELOW":
-        return ["background-color: #f7d4d4"] * len(row)
+        return ["background-color: #f7d4d4; color: black"] * len(row)
     elif s == "ABOVE BOTH":
-        return ["background-color: #eaf5ff"] * len(row)
+        return ["background-color: #eaf5ff; color: black"] * len(row)
     elif s == "BELOW BOTH":
-        return ["background-color: #fff0e0"] * len(row)
+        return ["background-color: #fff0e0; color: black"] * len(row)
     elif s == "CROSSING SUPPORT FROM BELOW":
-        return ["background-color: #c8f0d8"] * len(row)
+        return ["background-color: #c8f0d8; color: black"] * len(row)
     elif s == "CROSSING RESISTANCE FROM ABOVE":
-        return ["background-color: #f0d8c8"] * len(row)
+        return ["background-color: #f0d8c8; color: black"] * len(row)
     elif s == "CROSSED ABOVE VWAP FROM BELOW":
-        return ["background-color: #d8f0e8"] * len(row)
+        return ["background-color: #d8f0e8; color: black"] * len(row)
     elif s == "CROSSED BELOW VWAP FROM ABOVE":
-        return ["background-color: #f0e0d8"] * len(row)
+        return ["background-color: #f0e0d8; color: black"] * len(row)
     return [""] * len(row)
 
 
