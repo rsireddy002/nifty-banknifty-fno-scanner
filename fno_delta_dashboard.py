@@ -26,7 +26,6 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 # Streamlit Cloud servers run in UTC, not IST - use an explicit fixed IST
@@ -626,18 +625,59 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
             else:
                 state[vwap_key] = {"above": price_above_vwap}
 
+        # Single-level crossings: distinct, earlier-stage events from the
+        # "both levels" crossing logic above. Tracked independently per
+        # symbol so a support reclaim or resistance loss is caught even
+        # when the stock isn't (yet, or ever) above/below BOTH levels.
+        simple_status = "-"
+        if support is not None and current_price is not None:
+            support_key = f"{symbol}_support_side"
+            was_above_support = state.get(support_key, {}).get("above")
+            now_above_support = current_price > support
+            if was_above_support is False and now_above_support:
+                simple_status = "CROSSING SUPPORT FROM BELOW"
+            state[support_key] = {"above": now_above_support}
+
+        if resistance is not None and current_price is not None:
+            resistance_key = f"{symbol}_resistance_side"
+            was_above_resistance = state.get(resistance_key, {}).get("above")
+            now_above_resistance = current_price > resistance
+            if was_above_resistance is True and not now_above_resistance and simple_status == "-":
+                simple_status = "CROSSING RESISTANCE FROM ABOVE"
+            state[resistance_key] = {"above": now_above_resistance}
+
+        # Both-level events take priority over single-level ones when both apply
+        if status.startswith("JUST CROSSED UP"):
+            simple_status = "CROSSED UP"
+        elif status.startswith("JUST CROSSED DOWN"):
+            simple_status = "CROSSED BELOW"
+        elif status == "ABOVE BOTH (continuing)":
+            simple_status = "ABOVE BOTH"
+        elif status == "BELOW BOTH (continuing)":
+            simple_status = "BELOW BOTH"
+
+        # Distance to the NEXT level in the direction of the current move -
+        # room to run before hitting the next real obstacle
+        next_level_distance_pct = None
+        if is_above_both and next_resistance is not None and current_price:
+            next_level_distance_pct = round(((next_resistance - current_price) / current_price) * 100, 2)
+        elif is_below_both and next_support is not None and current_price:
+            next_level_distance_pct = round(((current_price - next_support) / current_price) * 100, 2)
+
         results.append({
             "Symbol": symbol, "Sector": get_sector(symbol), "CurrentPrice": current_price,
             "POC": poc, "VWAP": vwap,
             "DeltaSupport": support, "DeltaResistance": resistance,
             "NextSupport": next_support, "NextResistance": next_resistance,
+            "NextLevelDistance%": next_level_distance_pct,
             "ZoneWidth%": zone_width_pct,
             "%Move": (
                 round(((current_price - resistance) / resistance) * 100, 2) if is_above_both
                 else round(((support - current_price) / support) * 100, 2) if is_below_both
                 else None
             ),
-            "RVOL%": rvol_pct, "Status": status, "VWAPSetup": vwap_setup_detail,
+            "RVOL%": rvol_pct, "Status": status, "SimpleStatus": simple_status,
+            "VWAPSetup": vwap_setup_detail,
             "IsIndex": levels.get("is_index", False),
         })
 
@@ -859,27 +899,152 @@ def signed_move(row):
 heatmap_df["SignedMove"] = heatmap_df.apply(signed_move, axis=1)
 heatmap_df["BoxSize"] = heatmap_df["SignedMove"].abs().clip(lower=0.1)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Heatmap", "Bullish (Up)", "Bearish (Down)", "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
+# Simplified view: just Symbol, CurrentPrice, VWAP, RVOL%, and the 5 status
+# categories - CROSSED UP, CROSSED BELOW, ABOVE BOTH, CROSSING SUPPORT FROM
+# BELOW, CROSSING RESISTANCE FROM ABOVE. Only active signals, no extra columns.
+simple_status_order = {
+    "CROSSED UP": 0, "CROSSED BELOW": 1, "ABOVE BOTH": 2, "BELOW BOTH": 3,
+    "CROSSING SUPPORT FROM BELOW": 4, "CROSSING RESISTANCE FROM ABOVE": 5,
+}
+simple_df = result_df[result_df["SimpleStatus"] != "-"].copy()
+simple_df["_sort"] = simple_df["SimpleStatus"].map(simple_status_order).fillna(9)
+simple_df["_index_pin"] = simple_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+simple_df = simple_df.sort_values(["_index_pin", "_sort"], ascending=[False, True]).drop(columns=["_sort", "_index_pin"])
+simple_df = simple_df[["Symbol", "CurrentPrice", "VWAP", "RVOL%", "SimpleStatus"]].reset_index(drop=True)
+simple_df.insert(0, "S.No", range(1, len(simple_df) + 1))
+
+
+def highlight_simple_status(row):
+    s = row["SimpleStatus"]
+    if s == "CROSSED UP":
+        return ["background-color: #d4f7d4"] * len(row)
+    elif s == "CROSSED BELOW":
+        return ["background-color: #f7d4d4"] * len(row)
+    elif s == "ABOVE BOTH":
+        return ["background-color: #eaf5ff"] * len(row)
+    elif s == "BELOW BOTH":
+        return ["background-color: #fff0e0"] * len(row)
+    elif s == "CROSSING SUPPORT FROM BELOW":
+        return ["background-color: #c8f0d8"] * len(row)
+    elif s == "CROSSING RESISTANCE FROM ABOVE":
+        return ["background-color: #f0d8c8"] * len(row)
+    return [""] * len(row)
+
+
+# Dedicated NIFTY / BankNifty table - full detail since it's only 2 rows
+index_cols = ["Symbol", "CurrentPrice", "POC", "VWAP", "DeltaSupport", "DeltaResistance",
+              "NextSupport", "NextResistance", "ZoneWidth%", "RVOL%", "Status", "SimpleStatus"]
+index_df = result_df[result_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])][index_cols].copy().reset_index(drop=True)
+
+# Tight-zone breakouts WITH ROOM: fresh full crossover (both levels), zone
+# under 0.5%, AND at least 1% of clear space to the next level in that
+# direction - high precision entry, not immediately capped
+tight_room_cols = ["Symbol", "CurrentPrice", "VWAP", "ZoneWidth%", "NextLevelDistance%", "RVOL%", "Status"]
+tight_breakout_room_df = result_df[
+    result_df["Status"].str.startswith("JUST CROSSED", na=False) &
+    (result_df["ZoneWidth%"].abs() < 0.5) &
+    (result_df["NextLevelDistance%"] >= 1.0)
+][tight_room_cols].copy()
+tight_breakout_room_df["_pin"] = tight_breakout_room_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+tight_breakout_room_df = tight_breakout_room_df.sort_values(
+    ["_pin", "NextLevelDistance%"], ascending=[False, False]
+).drop(columns="_pin").reset_index(drop=True)
+tight_breakout_room_df.insert(0, "S.No", range(1, len(tight_breakout_room_df) + 1))
+
+# Wide-zone single-level crossings: price just reclaimed support or just
+# lost resistance, but the zone itself is wide (>=1%) - a looser, earlier
+# setup, opposite in character to the tight-zone table above
+wide_single_cols = ["Symbol", "CurrentPrice", "VWAP", "ZoneWidth%", "RVOL%", "SimpleStatus"]
+wide_single_level_df = result_df[
+    result_df["SimpleStatus"].isin(["CROSSING SUPPORT FROM BELOW", "CROSSING RESISTANCE FROM ABOVE"]) &
+    (result_df["ZoneWidth%"].abs() >= 1.0)
+][wide_single_cols].copy()
+wide_single_level_df["_pin"] = wide_single_level_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+wide_single_level_df = wide_single_level_df.sort_values(
+    ["_pin", "ZoneWidth%"], ascending=[False, False]
+).drop(columns="_pin").reset_index(drop=True)
+wide_single_level_df.insert(0, "S.No", range(1, len(wide_single_level_df) + 1))
+
+tabI, tabT, tabW, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level",
+     "Simple View", "Sector Movers", "Bullish (Up)", "Bearish (Down)",
+     "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
 )
 
-with tab1:
-    st.caption("Box size = magnitude of move, color = direction and strength (green = bullish, red = bearish). "
-               "Grouped by sector, so you can spot whether a move is sector-wide or isolated at a glance.")
-    if heatmap_df.empty:
-        st.write("No active signals to visualize currently.")
+with tabT:
+    st.caption("Fresh full breakouts (both levels) where the zone is tight (<0.5%) AND there's at least 1% of clear "
+               "room to the next level in that direction - high-precision entries that aren't immediately capped.")
+    if tight_breakout_room_df.empty:
+        st.write("No matching signals currently.")
     else:
-        fig = px.treemap(
-            heatmap_df,
-            path=["Sector", "Symbol"],
-            values="BoxSize",
-            color="SignedMove",
-            color_continuous_scale="RdYlGn",
-            color_continuous_midpoint=0,
-            hover_data={"CurrentPrice": True, "Status": True, "BoxSize": False, "SignedMove": ":.2f"},
+        st.dataframe(tight_breakout_room_df, use_container_width=True, hide_index=True)
+        csv_tr = tight_breakout_room_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download tight-zone+room CSV", csv_tr, "fno_tight_zone_room.csv", "text/csv")
+
+with tabW:
+    st.caption("Price just reclaimed support (from below) or just lost resistance (from above), but the zone itself "
+               "is wide (>=1%) - a looser, single-level setup, the opposite character to the tight-zone table.")
+    if wide_single_level_df.empty:
+        st.write("No matching signals currently.")
+    else:
+        st.dataframe(wide_single_level_df, use_container_width=True, hide_index=True)
+        csv_ws = wide_single_level_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download wide-zone single-level CSV", csv_ws, "fno_wide_single_level.csv", "text/csv")
+
+with tabI:
+    st.caption("NIFTY and BANK NIFTY futures - full detail, always shown regardless of status.")
+    if index_df.empty:
+        st.write("No index futures data - run Precompute first.")
+    else:
+        st.dataframe(
+            index_df.style.apply(highlight_status, axis=1),
+            use_container_width=True,
+            hide_index=True,
         )
-        fig.update_layout(margin=dict(t=10, l=10, r=10, b=10), height=650)
-        st.plotly_chart(fig, use_container_width=True)
+        csv_index = index_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download NIFTY/BankNifty CSV", csv_index, "fno_index_futures.csv", "text/csv")
+
+with tab0:
+    st.caption("Just the essentials: Symbol, CurrentPrice, VWAP, RVOL%, and status. "
+               "CROSSED UP/BELOW = fresh full breakout. ABOVE/BELOW BOTH = continuing. "
+               "CROSSING SUPPORT/RESISTANCE = single-level event, earlier signal.")
+    if simple_df.empty:
+        st.write("No active signals currently.")
+    else:
+        st.dataframe(
+            simple_df.style.apply(highlight_simple_status, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv_simple = simple_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download simple view CSV", csv_simple, "fno_simple_view.csv", "text/csv")
+
+with tab1:
+    st.caption("Stocks grouped by sector, ordered by sector strength (% above VWAP). "
+               "Within each sector, sorted by %Move - strongest movers first.")
+    if heatmap_df.empty:
+        st.write("No active signals to display currently.")
+    else:
+        sector_order = sector_df.sort_values("PctAboveVWAP", ascending=False)["Sector"].tolist()
+        display_cols = ["Symbol", "CurrentPrice", "%Move", "RVOL%", "ZoneWidth%", "Status"]
+
+        for sector in sector_order:
+            sector_stocks = heatmap_df[heatmap_df["Sector"] == sector].copy()
+            if sector_stocks.empty:
+                continue
+            sector_stocks = sector_stocks.sort_values("SignedMove", ascending=False)
+            sector_breadth_row = sector_df[sector_df["Sector"] == sector]
+            pct_above = sector_breadth_row["PctAboveVWAP"].iloc[0] if not sector_breadth_row.empty else None
+
+            header = f"{sector}"
+            if pct_above is not None:
+                header += f" — {pct_above}% above VWAP"
+            st.markdown(f"**{header}**")
+            st.dataframe(
+                sector_stocks[display_cols].style.apply(highlight_status, axis=1),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 with tab2:
     if bullish_df.empty:
