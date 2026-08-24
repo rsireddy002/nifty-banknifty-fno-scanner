@@ -459,9 +459,11 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
             status = "no prior delta zone yet"
             zone_width_pct = None
             next_support = next_resistance = None
+            is_above_both = is_below_both = False
         else:
             zone_width_pct = round(((resistance - support) / current_price) * 100, 2)
-            is_wide_zone = zone_width_pct > max_zone_width_pct
+            is_inverted_zone = zone_width_pct < 0
+            is_wide_zone = abs(zone_width_pct) > max_zone_width_pct
 
             swing_lows = levels.get("swing_lows", [])
             swing_highs = levels.get("swing_highs", [])
@@ -487,8 +489,11 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
                 else:
                     status = f"JUST CROSSED UP @ {now_time_str}"
                     state[symbol] = {"status": "crossed_up", "time": now_time_str}
-                if status.startswith("JUST CROSSED") and is_wide_zone:
-                    status += " (wide zone - caution)"
+                if status.startswith("JUST CROSSED"):
+                    if is_inverted_zone:
+                        status += " (INVERTED ZONE - unreliable)"
+                    elif is_wide_zone:
+                        status += " (wide zone - caution)"
             elif is_below_both:
                 if already_below_yesterday and prior_status is None:
                     status = "BELOW BOTH (continuing)"
@@ -501,8 +506,11 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
                 else:
                     status = f"JUST CROSSED DOWN @ {now_time_str}"
                     state[symbol] = {"status": "crossed_down", "time": now_time_str}
-                if status.startswith("JUST CROSSED") and is_wide_zone:
-                    status += " (wide zone - caution)"
+                if status.startswith("JUST CROSSED"):
+                    if is_inverted_zone:
+                        status += " (INVERTED ZONE - unreliable)"
+                    elif is_wide_zone:
+                        status += " (wide zone - caution)"
             else:
                 status = "-"
                 if symbol in state:
@@ -513,6 +521,11 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5):
             "DeltaSupport": support, "DeltaResistance": resistance,
             "NextSupport": next_support, "NextResistance": next_resistance,
             "ZoneWidth%": zone_width_pct,
+            "%Move": (
+                round(((current_price - resistance) / resistance) * 100, 2) if is_above_both
+                else round(((support - current_price) / support) * 100, 2) if is_below_both
+                else None
+            ),
             "RVOL%": rvol_pct, "Status": status,
             "IsIndex": levels.get("is_index", False),
         })
@@ -650,7 +663,9 @@ intraday_df["S.No"] = range(1, len(intraday_df) + 1)
 
 def highlight_status(row):
     status = row["Status"]
-    if "(wide zone" in status:
+    if "INVERTED ZONE" in status:
+        return ["background-color: #5a2a4a"] * len(row)  # dark magenta - structurally unreliable
+    elif "(wide zone" in status:
         return ["background-color: #4a4a2a"] * len(row)  # dim yellow-gray - caution, don't enter
     elif status.startswith("JUST CROSSED UP"):
         return ["background-color: #d4f7d4"] * len(row)  # green - fresh bullish
@@ -663,9 +678,49 @@ def highlight_status(row):
     return [""] * len(row)
 
 
-tab1, tab2 = st.tabs(["Intraday Watchlist", "Full Scan"])
+bullish_df = intraday_df[
+    intraday_df["Status"].str.contains("UP", na=False) | (intraday_df["Status"] == "ABOVE BOTH (continuing)")
+].copy()
+bullish_df["_index_pin"] = bullish_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+bullish_df = bullish_df.sort_values(["_index_pin", "%Move"], ascending=[False, False], na_position="last").drop(columns="_index_pin").reset_index(drop=True)
+bullish_df["S.No"] = range(1, len(bullish_df) + 1)
+
+bearish_df = intraday_df[
+    intraday_df["Status"].str.contains("DOWN", na=False) | (intraday_df["Status"] == "BELOW BOTH (continuing)")
+].copy()
+bearish_df["_index_pin"] = bearish_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+bearish_df = bearish_df.sort_values(["_index_pin", "%Move"], ascending=[False, False], na_position="last").drop(columns="_index_pin").reset_index(drop=True)
+bearish_df["S.No"] = range(1, len(bearish_df) + 1)
+
+tab1, tab2, tab3, tab4 = st.tabs(["Bullish (Up)", "Bearish (Down)", "All Intraday", "Full Scan"])
 
 with tab1:
+    if bullish_df.empty:
+        st.write("No bullish signals currently.")
+    else:
+        st.caption("Sorted by %Move - how far price has moved above the broken Delta Resistance.")
+        st.dataframe(
+            bullish_df.style.apply(highlight_status, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv_bull = bullish_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download bullish CSV", csv_bull, "fno_bullish_watchlist.csv", "text/csv")
+
+with tab2:
+    if bearish_df.empty:
+        st.write("No bearish signals currently.")
+    else:
+        st.caption("Sorted by %Move - how far price has moved below the broken Delta Support.")
+        st.dataframe(
+            bearish_df.style.apply(highlight_status, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv_bear = bearish_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download bearish CSV", csv_bear, "fno_bearish_watchlist.csv", "text/csv")
+
+with tab3:
     if intraday_df.empty:
         st.write("No stocks currently above both delta levels.")
     else:
@@ -677,7 +732,7 @@ with tab1:
         csv = intraday_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download watchlist CSV", csv, "fno_intraday_watchlist.csv", "text/csv")
 
-with tab2:
+with tab4:
     st.dataframe(result_df, use_container_width=True, hide_index=True)
     csv_full = result_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download full scan CSV", csv_full, "fno_live_full.csv", "text/csv")
