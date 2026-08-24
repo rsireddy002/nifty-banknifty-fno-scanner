@@ -834,6 +834,7 @@ sector_df = pd.DataFrame(sector_rows).sort_values("PctAboveVWAP", ascending=Fals
 vwap_setup_df = result_df[result_df["VWAPSetup"].notna()].copy()
 vwap_setup_df = vwap_setup_df.sort_values("VWAPSetup").reset_index(drop=True)
 if not vwap_setup_df.empty:
+    vwap_setup_df = vwap_setup_df.drop(columns=["S.No"], errors="ignore")
     vwap_setup_df.insert(0, "S.No", range(1, len(vwap_setup_df) + 1))
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
