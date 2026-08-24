@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 # Streamlit Cloud servers run in UTC, not IST - use an explicit fixed IST
@@ -837,11 +838,50 @@ if not vwap_setup_df.empty:
     vwap_setup_df = vwap_setup_df.drop(columns=["S.No"], errors="ignore")
     vwap_setup_df.insert(0, "S.No", range(1, len(vwap_setup_df) + 1))
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Bullish (Up)", "Bearish (Down)", "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
+# Heatmap data: signed move (positive = bullish, negative = bearish) so the
+# treemap can color green/red like a standard market heatmap
+heatmap_df = intraday_df[intraday_df["Symbol"] != ""].copy()
+heatmap_df = heatmap_df[heatmap_df["Sector"].notna()]
+
+
+def signed_move(row):
+    status = str(row["Status"])
+    move = row["%Move"]
+    if pd.isna(move):
+        move = 0.1  # give continuing-only rows a small nonzero size to stay visible
+    if "UP" in status or status == "ABOVE BOTH (continuing)":
+        return abs(move)
+    elif "DOWN" in status or status == "BELOW BOTH (continuing)":
+        return -abs(move)
+    return 0
+
+
+heatmap_df["SignedMove"] = heatmap_df.apply(signed_move, axis=1)
+heatmap_df["BoxSize"] = heatmap_df["SignedMove"].abs().clip(lower=0.1)
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["Heatmap", "Bullish (Up)", "Bearish (Down)", "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
 )
 
 with tab1:
+    st.caption("Box size = magnitude of move, color = direction and strength (green = bullish, red = bearish). "
+               "Grouped by sector, so you can spot whether a move is sector-wide or isolated at a glance.")
+    if heatmap_df.empty:
+        st.write("No active signals to visualize currently.")
+    else:
+        fig = px.treemap(
+            heatmap_df,
+            path=["Sector", "Symbol"],
+            values="BoxSize",
+            color="SignedMove",
+            color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
+            hover_data={"CurrentPrice": True, "Status": True, "BoxSize": False, "SignedMove": ":.2f"},
+        )
+        fig.update_layout(margin=dict(t=10, l=10, r=10, b=10), height=650)
+        st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
     if bullish_df.empty:
         st.write("No bullish signals currently.")
     else:
@@ -854,7 +894,7 @@ with tab1:
         csv_bull = bullish_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download bullish CSV", csv_bull, "fno_bullish_watchlist.csv", "text/csv")
 
-with tab2:
+with tab3:
     if bearish_df.empty:
         st.write("No bearish signals currently.")
     else:
@@ -867,7 +907,7 @@ with tab2:
         csv_bear = bearish_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download bearish CSV", csv_bear, "fno_bearish_watchlist.csv", "text/csv")
 
-with tab3:
+with tab4:
     st.caption("Breadth per sector: what % of stocks are trading above VWAP right now, plus clean breakout and VWAP-reclaim setup counts. "
                "A sector near 100% above VWAP with several breakouts suggests a genuine sector-wide move, not an isolated stock.")
     if sector_df.empty:
@@ -877,7 +917,7 @@ with tab3:
         csv_sector = sector_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download sector overview CSV", csv_sector, "fno_sector_overview.csv", "text/csv")
 
-with tab4:
+with tab5:
     st.caption("VWAP sitting just above Delta Support with 1-2% room to Delta Resistance, and price currently above VWAP - "
                "a distinct setup from the support/resistance zone breakouts.")
     if vwap_setup_df.empty:
@@ -887,7 +927,7 @@ with tab4:
         csv_vwap = vwap_setup_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download VWAP setups CSV", csv_vwap, "fno_vwap_setups.csv", "text/csv")
 
-with tab5:
+with tab6:
     if intraday_df.empty:
         st.write("No stocks currently above both delta levels.")
     else:
@@ -899,7 +939,7 @@ with tab5:
         csv = intraday_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download watchlist CSV", csv, "fno_intraday_watchlist.csv", "text/csv")
 
-with tab6:
+with tab7:
     st.dataframe(result_df, use_container_width=True, hide_index=True)
     csv_full = result_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download full scan CSV", csv_full, "fno_live_full.csv", "text/csv")
