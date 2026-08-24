@@ -1043,11 +1043,65 @@ if not log_df.empty:
     log_df.insert(0, "S.No", range(1, len(log_df) + 1))
     log_df.columns = ["S.No", "Time", "Symbol", "Category", "CurrentPrice", "VWAP", "ZoneWidth%", "Detail"]
 
-tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level", "Signal Log (Today)",
+# ONE simple decision sheet: Symbol, Action (BUY/SELL), entry price,
+# stop-loss, target. Only fresh events (not "continuing"), so the list
+# stays short and each row is an actual actionable idea, not a status log.
+BUY_STATUSES = ["CROSSED UP", "CROSSING SUPPORT FROM BELOW", "CROSSED ABOVE VWAP FROM BELOW"]
+SELL_STATUSES = ["CROSSED BELOW", "CROSSING RESISTANCE FROM ABOVE", "CROSSED BELOW VWAP FROM ABOVE"]
+
+trade_rows = []
+for _, row in result_df.iterrows():
+    s = row["SimpleStatus"]
+    if s in BUY_STATUSES:
+        stop_loss = row["DeltaSupport"]
+        target = row["NextResistance"] if pd.notna(row["NextResistance"]) else row["DeltaResistance"]
+        trade_rows.append({
+            "Symbol": row["Symbol"], "Action": "BUY", "Price": row["CurrentPrice"],
+            "StopLoss": stop_loss, "Target": target, "RVOL%": row["RVOL%"],
+        })
+    elif s in SELL_STATUSES:
+        stop_loss = row["DeltaResistance"]
+        target = row["NextSupport"] if pd.notna(row["NextSupport"]) else row["DeltaSupport"]
+        trade_rows.append({
+            "Symbol": row["Symbol"], "Action": "SELL", "Price": row["CurrentPrice"],
+            "StopLoss": stop_loss, "Target": target, "RVOL%": row["RVOL%"],
+        })
+
+trade_df = pd.DataFrame(trade_rows)
+if not trade_df.empty:
+    trade_df["_pin"] = trade_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+    trade_df = trade_df.sort_values(["_pin", "Action"], ascending=[False, True]).drop(columns="_pin").reset_index(drop=True)
+    trade_df.insert(0, "S.No", range(1, len(trade_df) + 1))
+
+
+def highlight_action(row):
+    if row["Action"] == "BUY":
+        return ["background-color: #d4f7d4; color: black"] * len(row)
+    elif row["Action"] == "SELL":
+        return ["background-color: #f7d4d4; color: black"] * len(row)
+    return [""] * len(row)
+
+
+tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["Trade Ideas", "NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level", "Signal Log (Today)",
      "Simple View", "Sector Movers", "Bullish (Up)", "Bearish (Down)",
      "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
 )
+
+with tabX:
+    st.caption("BUY = fresh bullish event (crossed up, support reclaim, or VWAP reclaim). SELL = fresh bearish event. "
+               "StopLoss = the level that would invalidate the idea if price falls back through it. "
+               "Target = the next level in that direction.")
+    if trade_df.empty:
+        st.write("No fresh trade ideas right now.")
+    else:
+        st.dataframe(
+            trade_df.style.apply(highlight_action, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv_trade = trade_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download trade ideas CSV", csv_trade, "fno_trade_ideas.csv", "text/csv")
 
 with tabL:
     st.caption("Every distinct Tight Zone+Room and Wide Zone Single-Level trigger seen today, for verification - "
