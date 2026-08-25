@@ -333,6 +333,14 @@ def compute_levels_and_baseline(df):
 
     today = df["date"].max()
     today_df = df[df["date"] == today].sort_values("timestamp")
+    last_close_val = round(today_df["close"].iloc[-1], 2) if not today_df.empty else None
+    # prevSupport/prevResistance after the loop finishes hold the value that
+    # will apply as the STARTING level for the NEXT day - i.e. what will
+    # actually be in effect when tomorrow's session begins, as opposed to
+    # support_before_today/resistance_before_today which is what was in
+    # effect BEFORE today (used to detect today's own crossings).
+    next_day_support_val = None if pd.isna(prevSupport) else round(prevSupport, 2)
+    next_day_resistance_val = None if pd.isna(prevResistance) else round(prevResistance, 2)
     prior_days_df = df[df["date"] < today]
     prior_days = sorted(prior_days_df["date"].unique())
 
@@ -392,6 +400,9 @@ def compute_levels_and_baseline(df):
         "poc": None if pd.isna(todayPOC) else round(todayPOC, 2),
         "delta_support": None if pd.isna(support_before_today) else round(support_before_today, 2),
         "delta_resistance": None if pd.isna(resistance_before_today) else round(resistance_before_today, 2),
+        "last_close": last_close_val,
+        "next_day_support": next_day_support_val,
+        "next_day_resistance": next_day_resistance_val,
         "yesterday_close": None if pd.isna(yesterday_close) else round(yesterday_close, 2),
         "already_above_yesterday": bool(already_above_yesterday),
         "already_below_yesterday": bool(already_below_yesterday),
@@ -487,12 +498,19 @@ def run_precompute(token, progress_callback=None):
 
 
 def fetch_batch_quotes(instrument_keys, token):
-    headers = {"Content-Type": "application/json", "Accept": "application/json",
-               "Authorization": f"Bearer {token}"}
+    headers = {
+        "Content-Type": "application/json", "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+    }
     all_data = {}
     for i in range(0, len(instrument_keys), BATCH_SIZE):
         chunk = instrument_keys[i:i + BATCH_SIZE]
-        params = {"instrument_key": ",".join(chunk)}
+        # Cache-busting timestamp param - some infra caches identical GET
+        # requests by URL, which would otherwise serve stale quotes on
+        # every refresh since the symbol list is the same each time.
+        params = {"instrument_key": ",".join(chunk), "_ts": str(int(time.time() * 1000))}
         max_retries = 4
         for attempt in range(max_retries):
             resp = requests.get(QUOTES_URL, headers=headers, params=params, timeout=20)
@@ -567,6 +585,17 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
     key_to_symbol = {cache[s]["instrument_key"]: s for s in symbols}
 
     quotes = fetch_batch_quotes(instrument_keys, token)
+
+    # Diagnostic: print raw quote details for one symbol so the logs show
+    # exactly what Upstox is returning right now, including any timestamp
+    # field it provides - this tells us definitively whether stale data is
+    # coming from Upstox itself or from something in our own processing.
+    if "PRESTIGE" in cache:
+        prestige_key = cache["PRESTIGE"]["instrument_key"]
+        raw_q = quotes.get(prestige_key) or next(
+            (v for v in quotes.values() if v.get("instrument_token") == prestige_key), None
+        )
+        print(f"[DIAGNOSTIC {now_time_str}] PRESTIGE raw quote: {raw_q}")
 
     results = []
     for quote_key, q in quotes.items():
@@ -1028,6 +1057,54 @@ index_cols = ["Symbol", "CurrentPrice", "POC", "VWAP", "DeltaSupport", "DeltaRes
               "NextSupport", "NextResistance", "ZoneWidth%", "RVOL%", "Status", "SimpleStatus"]
 index_df = result_df[result_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])][index_cols].copy().reset_index(drop=True)
 
+# Tomorrow's Watchlist: built from the cache directly (not the live scan),
+# using last_close and the TRUE next-day support/resistance (the levels as
+# they'll actually stand when tomorrow's session begins, after accounting
+# for anything today itself triggered) - not the pre-today levels used for
+# detecting today's own crossings. Sorted by proximity: closest to breaking
+# out or down first, since those need watching most urgently tomorrow.
+tomorrow_rows = []
+for symbol, levels in cache.items():
+    last_close = levels.get("last_close")
+    nd_support = levels.get("next_day_support")
+    nd_resistance = levels.get("next_day_resistance")
+    if last_close is None or nd_support is None or nd_resistance is None:
+        continue
+    dist_to_resistance_pct = round(((nd_resistance - last_close) / last_close) * 100, 2)
+    dist_to_support_pct = round(((last_close - nd_support) / last_close) * 100, 2)
+    nd_zone_width_pct = round(((nd_resistance - nd_support) / last_close) * 100, 2)
+    closest_pct = min(abs(dist_to_resistance_pct), abs(dist_to_support_pct))
+    closest_side = "Resistance" if abs(dist_to_resistance_pct) <= abs(dist_to_support_pct) else "Support"
+    tomorrow_rows.append({
+        "Symbol": symbol, "LastClose": last_close,
+        "NextDaySupport": nd_support, "NextDayResistance": nd_resistance,
+        "ZoneWidth%": nd_zone_width_pct,
+        "ClosestTo": closest_side, "DistanceToClosest%": round(closest_pct, 2),
+    })
+
+tomorrow_df = pd.DataFrame(tomorrow_rows)
+if not tomorrow_df.empty:
+    # Merge in LIVE data so this table shows both the plan (static, from
+    # last close) AND what's actually happened since - the outcome.
+    live_cols = result_df[["Symbol", "CurrentPrice", "Status", "RVOL%"]].copy()
+    tomorrow_df = tomorrow_df.merge(live_cols, on="Symbol", how="left")
+    tomorrow_df["%MoveSinceClose"] = (
+        (tomorrow_df["CurrentPrice"] - tomorrow_df["LastClose"]) / tomorrow_df["LastClose"] * 100
+    ).round(2)
+
+    tomorrow_df["_pin"] = tomorrow_df["Symbol"].isin(["NIFTY", "BANKNIFTY"])
+    tomorrow_df = tomorrow_df.sort_values(
+        ["_pin", "DistanceToClosest%"], ascending=[False, True]
+    ).drop(columns="_pin").reset_index(drop=True)
+    tomorrow_df.insert(0, "S.No", range(1, len(tomorrow_df) + 1))
+
+    # Reorder: planning columns first, then the outcome columns
+    tomorrow_df = tomorrow_df[[
+        "S.No", "Symbol", "LastClose", "NextDaySupport", "NextDayResistance",
+        "ZoneWidth%", "ClosestTo", "DistanceToClosest%",
+        "CurrentPrice", "%MoveSinceClose", "Status", "RVOL%",
+    ]]
+
 # Tight-zone breakouts WITH ROOM: fresh full crossover (both levels), zone
 # under 0.5%, AND at least 1% of clear space to the next level in that
 # direction - high precision entry, not immediately capped
@@ -1149,11 +1226,27 @@ def highlight_action(row):
     return [""] * len(row)
 
 
-tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Trade Ideas", "NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level", "Signal Log (Today)",
-     "Simple View", "Sector Movers", "Bullish (Up)", "Bearish (Down)",
+tabTom, tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["Tomorrow's Watchlist", "Trade Ideas", "NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level",
+     "Signal Log (Today)", "Simple View", "Sector Movers", "Bullish (Up)", "Bearish (Down)",
      "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
 )
+
+with tabTom:
+    st.caption("First set of columns (LastClose through DistanceToClosest%) = the PLAN, fixed from last night's "
+               "Precompute, unchanged all day. CurrentPrice/%MoveSinceClose/Status/RVOL% = what's ACTUALLY happened "
+               "since, refreshed live. Sorted by DistanceToClosest% - stocks nearest to breaking out or down are "
+               "listed first, since those needed watching most urgently at today's open.")
+    if tomorrow_df.empty:
+        st.write("No data available - run Precompute first.")
+    else:
+        st.dataframe(
+            tomorrow_df.style.apply(highlight_status, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        csv_tomorrow = tomorrow_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download tomorrow's watchlist CSV", csv_tomorrow, "fno_tomorrows_watchlist.csv", "text/csv")
 
 with tabX:
     st.caption("BUY = fresh bullish event (crossed up, support reclaim, or VWAP reclaim). SELL = fresh bearish event. "
