@@ -942,6 +942,8 @@ intraday_df["S.No"] = range(1, len(intraday_df) + 1)
 
 def highlight_status(row):
     status = row["Status"]
+    if pd.isna(status) or not isinstance(status, str):
+        return [""] * len(row)
     if "INVERTED ZONE" in status:
         return ["background-color: #5a2a4a; color: white"] * len(row)  # dark magenta - structurally unreliable
     elif "(wide zone" in status:
@@ -1088,6 +1090,7 @@ if not tomorrow_df.empty:
     # last close) AND what's actually happened since - the outcome.
     live_cols = result_df[["Symbol", "CurrentPrice", "Status", "RVOL%"]].copy()
     tomorrow_df = tomorrow_df.merge(live_cols, on="Symbol", how="left")
+    tomorrow_df["Status"] = tomorrow_df["Status"].fillna("no live data yet")
     tomorrow_df["%MoveSinceClose"] = (
         (tomorrow_df["CurrentPrice"] - tomorrow_df["LastClose"]) / tomorrow_df["LastClose"] * 100
     ).round(2)
