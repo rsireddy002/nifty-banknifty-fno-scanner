@@ -57,6 +57,13 @@ SMOOTH_LEN = 5
 FO_CSV_LOCAL_PATH = "fo_mktlots.csv"
 CACHE_PATH = "fno_levels_cache.json"
 STATE_PATH = "fno_crossed_state.json"
+
+# Composite Score tab: uses DAILY candles (separate from the 5-min candles
+# above, which only cover 18 days - not enough for a 50/200-day MA).
+DAILY_UNIT = "days"
+DAILY_INTERVAL_VALUE = "1"
+DAILY_LOOKBACK_DAYS = 300
+SCORE_CACHE_PATH = "fno_scores_cache.json"
 SIGNAL_LOG_PATH = "fno_signal_log.json"
 INSTRUMENT_SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
 QUOTES_URL = "https://api.upstox.com/v2/market-quote/quotes"
@@ -497,6 +504,165 @@ def run_precompute(token, progress_callback=None):
     return cache, state
 
 
+# ---------------- Composite Score (MA50 + RSI momentum + Volume) ----------------
+
+def fetch_daily_candles(instrument_key, token, lookback_days=DAILY_LOOKBACK_DAYS):
+    """Same shape as fetch_candles(), but daily bars over a long lookback -
+    needed for 50/200-day moving averages, which the 18-day 5-min candles
+    used elsewhere in this file can't support."""
+    to_date = now_ist().strftime("%Y-%m-%d")
+    from_date = (now_ist() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    url = f"https://api.upstox.com/v3/historical-candle/{instrument_key}/{DAILY_UNIT}/{DAILY_INTERVAL_VALUE}/{to_date}/{from_date}"
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    candles = payload.get("data", {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+def compute_rsi(close_series, period=14):
+    delta = close_series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+
+def ma50_score(df):
+    """Trend score in [-1, 1]: 50% distance of price from MA50 (capped),
+    30% MA50 slope over the last 5 sessions, 20% MA50-vs-MA200 regime."""
+    ma50_series = df["close"].rolling(50).mean()
+    ma200_series = df["close"].rolling(200).mean()
+    if len(df) < 50 or pd.isna(ma50_series.iloc[-1]):
+        return None
+    ma50 = ma50_series.iloc[-1]
+    ma50_5ago = ma50_series.iloc[-5] if len(ma50_series) >= 5 else ma50
+    close = df["close"].iloc[-1]
+
+    dist_score = max(-1, min(1, (close - ma50) / ma50)) if ma50 else 0
+    slope = (ma50 - ma50_5ago) / ma50 if ma50 else 0
+    slope_score = max(-1, min(1, slope * 5))
+    ma200 = ma200_series.iloc[-1]
+    regime = 0 if pd.isna(ma200) else (1 if ma50 > ma200 else -1)
+
+    return max(-1, min(1, 0.5 * dist_score + 0.3 * slope_score + 0.2 * regime))
+
+
+def rsi_score_momentum(df, rsi_period=14, lookback=20):
+    """RSI change normalized by its own recent volatility, in [-1, 1]."""
+    rsi_series = compute_rsi(df["close"], rsi_period)
+    rsi_change = rsi_series.diff()
+    if rsi_change.dropna().empty:
+        return 0.0
+    change = rsi_change.iloc[-1]
+    stdev = rsi_change.rolling(lookback).std().iloc[-1]
+    if pd.isna(stdev) or stdev == 0 or pd.isna(change):
+        return 0.0
+    return max(-1, min(1, change / (2 * stdev)))
+
+
+def vol_score(df, lookback_vol=20):
+    """Volume ratio (capped at 1) signed by the direction of the last move."""
+    if len(df) < lookback_vol + 1:
+        return 0.0
+    avg_vol = df["volume"].rolling(lookback_vol).mean().iloc[-1]
+    curr_vol = df["volume"].iloc[-1]
+    ratio = (curr_vol / avg_vol) if avg_vol else 0
+    ratio = min(ratio, 1.0)
+    if df["close"].iloc[-1] > df["close"].iloc[-2]:
+        trend_sign = 1
+    elif df["close"].iloc[-1] < df["close"].iloc[-2]:
+        trend_sign = -1
+    else:
+        trend_sign = 0
+    return ratio * trend_sign
+
+
+def compute_composite_score(df):
+    if df.empty or len(df) < 60:
+        return None
+    ma50 = ma50_score(df)
+    if ma50 is None:
+        return None
+    rsi = rsi_score_momentum(df)
+    vol = vol_score(df)
+    return {
+        "ma50_score": round(ma50, 4),
+        "rsi_score": round(rsi, 4),
+        "vol_score": round(vol, 4),
+        "final_score": round(ma50 + rsi + vol, 4),
+    }
+
+
+def run_composite_scan(token, progress_callback=None):
+    """Slow, once-a-day scan (like run_precompute) - one daily-candle API
+    call per symbol - producing a ranked composite score table."""
+    results = []
+
+    for name in INDEX_FUTURES:
+        try:
+            instrument_key = resolve_futures_instrument_key(name, token)
+            if not instrument_key:
+                continue
+            time.sleep(REQUEST_DELAY_SECONDS)
+            df = fetch_daily_candles(instrument_key, token)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            scores = compute_composite_score(df)
+            if scores is None:
+                continue
+            scores["Symbol"] = name
+            scores["IsIndex"] = True
+            results.append(scores)
+            if progress_callback:
+                progress_callback(0, 0, name, "ok (index)")
+        except Exception as e:
+            if progress_callback:
+                progress_callback(0, 0, name, f"error: {e}")
+            continue
+
+    symbols = load_symbol_universe()
+    for i, symbol in enumerate(symbols, start=1):
+        try:
+            instrument_key = resolve_equity_instrument_key(symbol, token)
+            if not instrument_key:
+                if progress_callback:
+                    progress_callback(i, len(symbols), symbol, "no instrument key")
+                continue
+            time.sleep(REQUEST_DELAY_SECONDS)
+            df = fetch_daily_candles(instrument_key, token)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            scores = compute_composite_score(df)
+            if scores is None:
+                if progress_callback:
+                    progress_callback(i, len(symbols), symbol, "not enough daily history")
+                continue
+            scores["Symbol"] = symbol
+            scores["IsIndex"] = False
+            results.append(scores)
+            if progress_callback:
+                progress_callback(i, len(symbols), symbol, "ok")
+        except Exception as e:
+            if progress_callback:
+                progress_callback(i, len(symbols), symbol, f"error: {e}")
+            continue
+
+    score_df = pd.DataFrame(results)
+    if not score_df.empty:
+        score_df = score_df[["Symbol", "IsIndex", "ma50_score", "rsi_score", "vol_score", "final_score"]]
+        score_df = score_df.sort_values("final_score", ascending=False).reset_index(drop=True)
+
+    score_df.to_json(SCORE_CACHE_PATH, orient="records", indent=2)
+    return score_df
+
+
 def fetch_batch_quotes(instrument_keys, token):
     headers = {
         "Content-Type": "application/json", "Accept": "application/json",
@@ -836,6 +1002,12 @@ with st.sidebar:
     run_pre = st.button("Run Precompute", type="primary", use_container_width=True)
 
     st.divider()
+    st.header("Composite Score Scan (MA50 + RSI + Volume)")
+    st.caption("Separate from the precompute above - uses DAILY candles (~300 days) to rank "
+               "symbols by trend/momentum/volume alignment. Changes slowly - run once a day.")
+    run_score_scan = st.button("Run Composite Score Scan", use_container_width=True)
+
+    st.divider()
     st.header("Step 2: Live Refresh")
     max_zone_width_pct = st.slider(
         "Max Zone Width % (flag entries wider than this)", 0.5, 5.0, 1.5, 0.1,
@@ -883,6 +1055,30 @@ if run_pre:
                f"Fresh crossings will be detected live as they happen today.")
     st.session_state["cache"] = cache
     st.session_state["state"] = state
+
+# Run composite score scan
+if run_score_scan:
+    score_progress_bar = st.progress(0, text="Starting composite score scan...")
+
+    def score_progress_callback(i, total, symbol, result):
+        if total > 0:
+            score_progress_bar.progress(i / total, text=f"[{i}/{total}] {symbol}: {result}")
+        else:
+            score_progress_bar.progress(0, text=f"{symbol}: {result}")
+
+    with st.spinner("Running composite score scan (one daily-candle call per symbol)..."):
+        score_df_result = run_composite_scan(token, score_progress_callback)
+    score_progress_bar.empty()
+    st.success(f"Composite score scan complete: {len(score_df_result)} symbols scored.")
+    st.session_state["score_df"] = score_df_result
+
+if "score_df" not in st.session_state:
+    if os.path.exists(SCORE_CACHE_PATH):
+        st.session_state["score_df"] = pd.read_json(SCORE_CACHE_PATH, orient="records")
+    else:
+        st.session_state["score_df"] = pd.DataFrame()
+
+score_df = st.session_state["score_df"]
 
 # Load cache/state from disk if not in session
 if "cache" not in st.session_state:
@@ -1229,10 +1425,10 @@ def highlight_action(row):
     return [""] * len(row)
 
 
-tabTom, tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Tomorrow's Watchlist", "Trade Ideas", "NIFTY & BankNifty", "Tight Zone + Room", "Wide Zone Single-Level",
-     "Signal Log (Today)", "Simple View", "Sector Movers", "Bullish (Up)", "Bearish (Down)",
-     "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
+tabTom, tabScore, tabX, tabI, tabT, tabW, tabL, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["Tomorrow's Watchlist", "Composite Score", "Trade Ideas", "NIFTY & BankNifty", "Tight Zone + Room",
+     "Wide Zone Single-Level", "Signal Log (Today)", "Simple View", "Sector Movers", "Bullish (Up)",
+     "Bearish (Down)", "Sector Overview", "VWAP Setups", "All Intraday", "Full Scan"]
 )
 
 with tabTom:
@@ -1250,6 +1446,18 @@ with tabTom:
         )
         csv_tomorrow = tomorrow_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download tomorrow's watchlist CSV", csv_tomorrow, "fno_tomorrows_watchlist.csv", "text/csv")
+
+with tabScore:
+    st.caption("Ranks symbols by a composite of trend (MA50 distance/slope + MA200 regime), RSI momentum, "
+               "and volume-with-trend, each normalized to -1..+1 and summed into final_score. Uses DAILY "
+               "candles, so it moves slowly day to day - run the scan from the sidebar once a day, not on "
+               "every live refresh.")
+    if score_df.empty:
+        st.write("No data available - run the Composite Score Scan from the sidebar first.")
+    else:
+        st.dataframe(score_df, use_container_width=True, hide_index=True)
+        csv_score = score_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download composite scores CSV", csv_score, "fno_composite_scores.csv", "text/csv")
 
 with tabX:
     st.caption("BUY = fresh bullish event (crossed up, support reclaim, or VWAP reclaim). SELL = fresh bearish event. "
