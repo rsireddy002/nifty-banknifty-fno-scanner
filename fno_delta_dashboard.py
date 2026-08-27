@@ -290,6 +290,29 @@ def find_swing_points(df, pivot_window=12):
     return sorted(set(swing_lows)), sorted(set(swing_highs))
 
 
+def compute_atr(df, period=14):
+    """Average True Range on the 5-min bars already being fetched for this
+    dashboard - measures typical bar-to-bar volatility, used to size the
+    Target distance for a given symbol instead of a fixed % or a nearby
+    swing point (both of which can be arbitrarily too tight or too wide
+    relative to how much this particular stock actually moves).
+    True Range = max(high-low, |high-prev_close|, |low-prev_close|).
+    Returns the latest ATR value (in price units, not %), or None if there
+    isn't enough history yet."""
+    if len(df) < period + 1:
+        return None
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr_series = tr.rolling(period).mean()
+    latest = atr_series.iloc[-1]
+    return None if pd.isna(latest) else round(latest, 2)
+
+
 def compute_levels_and_baseline(df):
     df = df.copy()
     df["volumeDelta"] = (df["close"] - df["open"]) * df["volume"]
@@ -405,6 +428,7 @@ def compute_levels_and_baseline(df):
         rvol_baseline = {t: sum(v) / len(v) for t, v in rvol_baseline.items()}
 
     swing_lows, swing_highs = find_swing_points(df)
+    atr_val = compute_atr(df, period=14)
 
     # Rolling buffer of recent 5-min closes, used to power the Intraday
     # Composite Score (MA20 + RSI + Volume, all on 5-min bars) so that
@@ -432,6 +456,7 @@ def compute_levels_and_baseline(df):
         "swing_highs": swing_highs,
         "computed_date": str(today),
         "intraday_closes": intraday_closes,
+        "atr": atr_val,
     }
 
 
@@ -886,6 +911,7 @@ def log_new_paper_trades(log, signals_df):
             "stop_loss": row["StopLoss"],
             "target": row["Target"],
             "reward_risk": row.get("RewardRisk"),
+            "target_source": row.get("TargetSource"),
             "confidence": row["Confidence"],
             "rvol_at_entry": row.get("RVOL%"),
             "why": row.get("Why"),
@@ -947,6 +973,7 @@ def build_paper_trade_df(log, result_df):
         rows.append({
             "Symbol": t["symbol"], "Action": t["action"], "EntryTime": t["entry_time"],
             "EntryPrice": t["entry_price"], "StopLoss": t["stop_loss"], "Target": t["target"],
+            "TargetSource": t.get("target_source"),
             "RewardRisk": t.get("reward_risk"), "Confidence": t["confidence"],
             "RVOL@Entry": t.get("rvol_at_entry"), "Status": t["status"],
             "ExitPrice": t["exit_price"], "ExitTime": t["exit_time"],
@@ -1209,6 +1236,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
             "IntradayRSIScore": intraday_score["rsi_score"] if intraday_score else None,
             "IntradayVolScore": intraday_score["vol_score"] if intraday_score else None,
             "IntradayFinalScore": intraday_score["final_score"] if intraday_score else None,
+            "ATR": levels.get("atr"),
             "IsIndex": levels.get("is_index", False),
         })
 
@@ -1266,11 +1294,19 @@ with st.sidebar:
         help="If the gap between Delta Support and Delta Resistance exceeds this % of price, "
              "fresh crossover signals get flagged '(wide zone - caution)' instead of treated as clean entries."
     )
+    atr_target_multiple = st.slider(
+        "Target = ATR × this multiple (Trade Ideas / Signals)", 0.5, 4.0, 1.5, 0.1,
+        help="Target is set at Entry Price ± (14-period ATR on 5-min bars) × this multiple, so it scales "
+             "with how much THIS stock actually moves rather than a fixed % or the nearest swing point "
+             "(which could be too close on a quiet stock, or too far on a volatile one). "
+             "Falls back to the Reward:Risk-based projection below if ATR isn't available yet (e.g. "
+             "cache built before this feature existed - re-run Precompute)."
+    )
     min_reward_risk_ratio = st.slider(
-        "Min Reward:Risk Ratio (Trade Ideas / Signals)", 0.5, 3.0, 1.0, 0.1,
-        help="Target distance must be at least this many times the StopLoss distance, or the trade idea "
-             "is dropped entirely. E.g. 1.0 = target must be at least as far away as the stop "
-             "(no more 'risk 680 points to make 60' trades getting through)."
+        "Min Reward:Risk Ratio (safety-net filter)", 0.5, 3.0, 1.0, 0.1,
+        help="Even with an ATR-based target, this still acts as a floor: if the ATR-projected target ends up "
+             "less than this many times the StopLoss distance, the trade idea is dropped entirely. Also used "
+             "directly as the projection multiple on the rare fallback path when ATR isn't available."
     )
     with st.expander("VWAP Reclaim Setup thresholds"):
         vwap_above_support_max_pct = st.slider(
@@ -1618,12 +1654,17 @@ if not log_df.empty:
 # for a BUY, Target must be genuinely above Price and StopLoss genuinely
 # below (and vice versa for SELL) - a broken fallback level (e.g. from an
 # inverted zone) that would put Target on the wrong side gets excluded
-# rather than shown with a nonsensical number. A minimum distance also
-# filters out setups with negligible reward or a stop so tight it offers
-# no real room. On top of that, a minimum Reward:Risk ratio (set in the
-# sidebar) rejects trades where the stop is far away but the target is
-# barely past entry - e.g. risking 680 points to make 60 would previously
-# have passed the bare minimum-distance checks; it won't pass this one.
+# rather than shown with a nonsensical number. Target is set from ATR (14-
+# period, 5-min bars) x the sidebar's ATR multiple - scaling with how much
+# THIS stock actually moves - rather than pulled from the nearest swing
+# point (NextSupport/NextResistance), which could sit arbitrarily close to
+# price on quiet stocks and produce razor-thin, cost-eating targets even
+# when the old Reward:Risk-only check looked fine on paper. If ATR isn't
+# cached yet for a symbol (re-run Precompute to populate it), falls back to
+# projecting the target from the stop-loss distance x Min Reward:Risk Ratio.
+# Either way, the Min Reward:Risk Ratio slider still acts as a final floor -
+# an ATR-based target that ends up too small relative to its own stop gets
+# dropped rather than shown.
 BUY_STATUSES = ["CROSSED UP", "CROSSING SUPPORT FROM BELOW", "CROSSED ABOVE VWAP FROM BELOW"]
 SELL_STATUSES = ["CROSSED BELOW", "CROSSING RESISTANCE FROM ABOVE", "CROSSED BELOW VWAP FROM ABOVE"]
 MIN_TARGET_DISTANCE_PCT = 0.1
@@ -1635,50 +1676,52 @@ for _, row in result_df.iterrows():
     price = row["EntryPrice"]
     if pd.isna(price):
         continue
+    atr = row.get("ATR")
+    has_atr = pd.notna(atr) and atr > 0
 
     if s in BUY_STATUSES:
         stop_loss = row["DeltaSupport"]
-        target = row["NextResistance"] if pd.notna(row["NextResistance"]) else row["DeltaResistance"]
-        if pd.isna(stop_loss) or pd.isna(target):
+        if pd.isna(stop_loss) or stop_loss >= price:
             continue
-        if not (stop_loss < price < target):
-            continue
-        reward_pct = (target - price) / price * 100
         risk_pct = (price - stop_loss) / price * 100
-        if reward_pct < MIN_TARGET_DISTANCE_PCT:
-            continue
         if risk_pct < MIN_STOPLOSS_DISTANCE_PCT:
             continue
-        if risk_pct <= 0 or reward_pct / risk_pct < min_reward_risk_ratio:
+        target = (price + atr * atr_target_multiple) if has_atr \
+            else price + (price - stop_loss) * min_reward_risk_ratio
+        reward_pct = (target - price) / price * 100
+        if reward_pct < MIN_TARGET_DISTANCE_PCT:
+            continue
+        if reward_pct / risk_pct < min_reward_risk_ratio:
             continue
         trade_rows.append({
             "Symbol": row["Symbol"], "Action": "BUY", "Price": price,
             "LTP": row["CurrentPrice"],
-            "StopLoss": stop_loss, "Target": target,
+            "StopLoss": stop_loss, "Target": round(target, 2),
             "RewardRisk": round(reward_pct / risk_pct, 2),
+            "TargetSource": "ATR" if has_atr else "Ratio (ATR unavailable)",
             "RVOL%": row["RVOL%"],
             "Time": row["SignalTime"],
         })
     elif s in SELL_STATUSES:
         stop_loss = row["DeltaResistance"]
-        target = row["NextSupport"] if pd.notna(row["NextSupport"]) else row["DeltaSupport"]
-        if pd.isna(stop_loss) or pd.isna(target):
+        if pd.isna(stop_loss) or stop_loss <= price:
             continue
-        if not (target < price < stop_loss):
-            continue
-        reward_pct = (price - target) / price * 100
         risk_pct = (stop_loss - price) / price * 100
-        if reward_pct < MIN_TARGET_DISTANCE_PCT:
-            continue
         if risk_pct < MIN_STOPLOSS_DISTANCE_PCT:
             continue
-        if risk_pct <= 0 or reward_pct / risk_pct < min_reward_risk_ratio:
+        target = (price - atr * atr_target_multiple) if has_atr \
+            else price - (stop_loss - price) * min_reward_risk_ratio
+        reward_pct = (price - target) / price * 100
+        if reward_pct < MIN_TARGET_DISTANCE_PCT:
+            continue
+        if reward_pct / risk_pct < min_reward_risk_ratio:
             continue
         trade_rows.append({
             "Symbol": row["Symbol"], "Action": "SELL", "Price": price,
             "LTP": row["CurrentPrice"],
-            "StopLoss": stop_loss, "Target": target,
+            "StopLoss": stop_loss, "Target": round(target, 2),
             "RewardRisk": round(reward_pct / risk_pct, 2),
+            "TargetSource": "ATR" if has_atr else "Ratio (ATR unavailable)",
             "RVOL%": row["RVOL%"],
             "Time": row["SignalTime"],
         })
@@ -1772,7 +1815,7 @@ if not trade_df.empty:
     ).drop(columns="_pin").reset_index(drop=True)
     signals_df.insert(0, "S.No", range(1, len(signals_df) + 1))
     signals_df = signals_df[["S.No", "Symbol", "Action", "Confidence", "Price", "LTP",
-                              "StopLoss", "Target", "RewardRisk", "RVOL%", "Time", "Why"]]
+                              "StopLoss", "Target", "TargetSource", "RewardRisk", "RVOL%", "Time", "Why"]]
 
 # Paper Trade Log - persist every Signals-tab idea the moment it first
 # appears, and mark-to-market/close out existing OPEN entries against the
@@ -1920,11 +1963,11 @@ with tabIS:
 with tabX:
     st.caption("BUY = fresh bullish event (crossed up, support reclaim, or VWAP reclaim). SELL = fresh bearish event. "
                "Price = entry price AT THE MOMENT the signal fired. LTP = current live price, for tracking how far "
-               "it's moved since entry. StopLoss/Target are validated against the entry price for directional sanity - "
-               "Target must be genuinely favorable and StopLoss genuinely unfavorable, each by at least 0.1%, or the "
-               "row is excluded. RewardRisk = Target distance ÷ StopLoss distance; trades below the sidebar's "
-               "Min Reward:Risk Ratio are dropped entirely, so a trade risking far more than it could gain "
-               "won't appear here. Time = when the underlying signal actually fired.")
+               "it's moved since entry. StopLoss = the broken Delta Support/Resistance level. Target is PROJECTED "
+               "from the StopLoss distance × the sidebar's Min Reward:Risk Ratio - not pulled from the nearest swing "
+               "point, which could sit arbitrarily close to price and produce a razor-thin target on quiet stocks. "
+               "RewardRisk = Target distance ÷ StopLoss distance (matches the sidebar ratio by construction). "
+               "Time = when the underlying signal actually fired.")
     if trade_df.empty:
         st.write("No fresh trade ideas right now.")
     else:
