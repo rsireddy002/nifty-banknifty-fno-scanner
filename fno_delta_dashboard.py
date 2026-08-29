@@ -30,6 +30,7 @@ import streamlit as st
 
 from sector_rotation import render_sector_rotation_tab
 from sector_rotation import render_sector_rotation_tab
+from hvn_lvn import build_volume_profile, find_hvn_lvn
 # Streamlit Cloud servers run in UTC, not IST - use an explicit fixed IST
 # offset for all "current time" logic so RVOL matching and crossover
 # timestamps are correct regardless of server timezone.
@@ -207,6 +208,18 @@ SECTOR_MAP = {
     "DELHIVERY": "Aviation & Logistics",
     "ADANIPORTS": "Diversified/Conglomerate",
 }
+
+
+def _nearest_hvn_levels(levels, price):
+    """Returns (nearest_hvn_above, nearest_hvn_below) given a cache entry's
+    levels dict and a reference price. Pools today_hvn + composite_hvn
+    together, same approach as live_strategy.py's SymbolState helpers."""
+    if price is None:
+        return None, None
+    pool = (levels.get("today_hvn") or []) + (levels.get("composite_hvn") or [])
+    above = [n["price"] for n in pool if n["price"] > price]
+    below = [n["price"] for n in pool if n["price"] < price]
+    return (min(above) if above else None), (max(below) if below else None)
 
 
 def get_sector(symbol):
@@ -437,6 +450,35 @@ def compute_levels_and_baseline(df):
     # even after the live scan appends the current tick as an extra bar.
     intraday_closes = df.tail(220)["close"].round(2).tolist()
 
+    # HVN/LVN: bin size derived from a FIXED TARGET BIN COUNT across each
+    # window's own price range, not a fixed point value or ATR fraction.
+    # ATR-based sizing broke down on stocks whose ATR is small relative to
+    # their multi-day range (RELIANCE composite came back with 13 "HVNs"
+    # crammed into a 21-point range - noise, not real nodes). A fixed bin
+    # COUNT keeps node granularity consistent regardless of instrument price
+    # level or ATR quirks.
+    TODAY_N_BINS = 30
+    COMPOSITE_N_BINS = 50
+    MIN_NODE_SEPARATION_BINS = 3
+
+    today_range = today_df["high"].max() - today_df["low"].min()
+    today_bin_size = max(today_range / TODAY_N_BINS, 0.01) if today_range > 0 else 0.01
+
+    composite_range = df["high"].max() - df["low"].min()
+    composite_bin_size = max(composite_range / COMPOSITE_N_BINS, 0.01) if composite_range > 0 else 0.01
+
+    try:
+        today_bins, today_vols = build_volume_profile(today_df, bin_size=today_bin_size)
+        today_hvn_lvn = find_hvn_lvn(today_bins, today_vols, min_bin_distance=MIN_NODE_SEPARATION_BINS)
+    except Exception:
+        today_hvn_lvn = {"hvns": [], "lvns": []}
+
+    try:
+        composite_bins, composite_vols = build_volume_profile(df, bin_size=composite_bin_size)
+        composite_hvn_lvn = find_hvn_lvn(composite_bins, composite_vols, min_bin_distance=MIN_NODE_SEPARATION_BINS)
+    except Exception:
+        composite_hvn_lvn = {"hvns": [], "lvns": []}
+
     return {
         "poc": None if pd.isna(todayPOC) else round(todayPOC, 2),
         "delta_support": None if pd.isna(support_before_today) else round(support_before_today, 2),
@@ -457,6 +499,10 @@ def compute_levels_and_baseline(df):
         "computed_date": str(today),
         "intraday_closes": intraday_closes,
         "atr": atr_val,
+        "today_hvn": today_hvn_lvn["hvns"],
+        "today_lvn": today_hvn_lvn["lvns"],
+        "composite_hvn": composite_hvn_lvn["hvns"],
+        "composite_lvn": composite_hvn_lvn["lvns"],
     }
 
 
@@ -1215,6 +1261,7 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
                                 "CROSSED ABOVE VWAP FROM BELOW", "CROSSED BELOW VWAP FROM ABOVE"):
             signal_time = now_time_str
 
+        nearest_hvn_above, nearest_hvn_below = _nearest_hvn_levels(levels, current_price)
         results.append({
             "Symbol": symbol, "Sector": get_sector(symbol), "CurrentPrice": current_price,
             "EntryPrice": entry_price if entry_price is not None else current_price,
@@ -1223,6 +1270,8 @@ def run_live_scan(cache, state, token, max_zone_width_pct=1.5,
             "NextSupport": next_support, "NextResistance": next_resistance,
             "NextLevelDistance%": next_level_distance_pct,
             "ZoneWidth%": zone_width_pct,
+            "NearestHVNAbove": nearest_hvn_above,
+            "NearestHVNBelow": nearest_hvn_below,
             "%Move": (
                 round(((current_price - resistance) / resistance) * 100, 2) if is_above_both
                 else round(((support - current_price) / support) * 100, 2) if is_below_both

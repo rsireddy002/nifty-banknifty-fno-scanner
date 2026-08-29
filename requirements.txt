@@ -5,3 +5,5 @@ streamlit-autorefresh
 plotly
 
 nselib
+
+numpy
